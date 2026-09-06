@@ -262,15 +262,12 @@ body{
 .btn.sm{padding:5px 9px;font-size:11px;}
 .btn:disabled{opacity:.5;cursor:not-allowed;}
 
-/* Requirement 1 — Strict Button Alignment: action buttons on cards/rows
-   (Staff Payroll, Dealers, Partners, Expenses, Package Building, etc.)
-   must always render in a single horizontal row underneath the data,
-   never stack vertically. flex-wrap:wrap was allowing buttons to fall
-   onto their own line on narrow/mobile widths, which reads as "stacked".
-   .actions-row forces one row always; if there truly isn't enough width
-   it scrolls horizontally instead of wrapping to a new line. */
-.actions-row{display:flex;flex-direction:row;flex-wrap:nowrap;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:2px;}
-.actions-row::-webkit-scrollbar{height:3px;}
+/* Requirement change: this row used to force a single horizontally-
+   scrolling line, which hid the last button(s) — including Delete on the
+   customer profile — off-screen on phones with no visual hint they
+   existed. Wrapping onto 2-3 rows keeps every action visible without
+   needing to scroll. */
+.actions-row{display:flex;flex-direction:row;flex-wrap:wrap;gap:6px;padding-bottom:2px;}
 .actions-row .btn{flex-shrink:0;}
 
 table{width:100%;border-collapse:collapse;font-size:12px;}
@@ -474,6 +471,7 @@ tr:hover td{background:#f8fafc;}
       <span>Sign in with Google</span>
     </button>
     <div id="loginStatus"></div>
+    <div id="loginDebug" style="font-size:10px;color:var(--text-light);margin-top:8px;line-height:1.5;"></div>
     <!-- BUGFIX (auth/security): the default admin username AND password used
          to be printed here in plain text on the public, pre-authentication
          login screen — visible to literally anyone who opened the app,
@@ -607,7 +605,7 @@ function readFirebaseOverride(){
 }
 const FIREBASE_CONFIG = Object.assign({}, FIREBASE_CONFIG_DEFAULT, readFirebaseOverride()||{});
 
-let fbApp = null, fbAuth = null, db = null, fbFunctions = null, fbAnalytics = null, FIREBASE_READY = false;
+let fbApp = null, fbAuth = null, db = null, fbFunctions = null, fbAnalytics = null, FIREBASE_READY = false, FIREBASE_INIT_ERROR = null;
 try{
   if(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.apiKey !== "YOUR_API_KEY"){
     fbApp = firebase.initializeApp(FIREBASE_CONFIG);
@@ -623,7 +621,7 @@ try{
       if(FIREBASE_CONFIG.measurementId && firebase.analytics) fbAnalytics = firebase.analytics();
     }catch(e){ console.warn("Firebase analytics skipped:", e.message); }
   }
-}catch(e){ console.warn("Firebase init skipped:", e.message); }
+}catch(e){ console.warn("Firebase init skipped:", e.message); FIREBASE_INIT_ERROR = e.message; }
 
 const BUSINESS_ID = "zahidy_main"; // /businesses/{BUSINESS_ID}
 
@@ -1211,6 +1209,7 @@ const Auth = {
     Auth._onLogin(demoUser, true);
   },
   async _onLogin(fbUser, isDemo, isDeveloperLogin, isBypassLogin){
+   try{
     // Persist local-only sessions (see LOCAL_SESSION_KEY above) so a page
     // refresh doesn't bounce these users back to the login screen. Real
     // Firebase logins don't need this — onAuthStateChanged already covers them.
@@ -1238,9 +1237,33 @@ const Auth = {
     // in from a new device. Pull the real users map from Firestore first
     // (when available) so the "first ever user" check reflects the whole
     // business, not just this one browser.
-    if(FIREBASE_READY && !isDemo && db){
+    // BUGFIX (sync): this used to skip the pre-login pull for every local
+    // login (local admin, local staff, Developer passkey, Owner bypass) —
+    // i.e. `isDemo` was true. That meant a fresh/different browser with an
+    // empty local cache would finish login using only its own blank
+    // default data, and the persist() call a few lines below would then
+    // do a full `{merge:false}` overwrite of the *shared* Firestore
+    // document with that blank data — wiping real data other browsers had
+    // already synced, before this browser ever had a chance to read it.
+    // Pull remote data first regardless of login type whenever Firebase is
+    // configured; only skip it for the offline Demo Mode identity itself
+    // (uid 'demo_admin'), which is intentionally local-only.
+    if(FIREBASE_READY && db && fbUser.uid !== 'demo_admin'){
       try{
-        const snap = await db.collection('businesses').doc(BUSINESS_ID).get();
+        // BUGFIX (login hang): the Firestore fetch above has no time limit
+        // of its own — a slow/unstable connection (or a browser blocking
+        // background network activity on a plain file:// page) could leave
+        // this await pending indefinitely, which silently froze the entire
+        // login (including Developer Access, which goes through this same
+        // function) with no error and no way in. Race it against an 8s
+        // timeout: if the cloud pull hasn't finished by then, fall back to
+        // whatever's in this browser's local cache and let login proceed —
+        // the Firestore listener attached after login will still catch up
+        // once the connection is available.
+        const snap = await Promise.race([
+          db.collection('businesses').doc(BUSINESS_ID).get(),
+          new Promise((_, reject)=> setTimeout(()=> reject(new Error('Pre-login sync timed out')), 8000))
+        ]);
         if(snap.exists){
           Object.assign(State.data, snap.data());
           repairData();
@@ -1314,6 +1337,18 @@ const Auth = {
     if(FIREBASE_READY) attachFirestoreListener();
     renderSidebar();
     goPage('dashboard');
+   }catch(e){
+    // BUGFIX (login hang): previously ANY error thrown anywhere in this
+    // function — a bad Firestore permission, a malformed saved record, a
+    // typo introduced by a future edit — left the login screen sitting
+    // there forever with the click having visibly done nothing, since the
+    // code that hides #loginOverlay never got reached and the error only
+    // ever showed up in the browser console (which is hard to reach on a
+    // phone). Surface it directly on the login screen instead, so it's
+    // never a silent dead end again.
+    console.error('Login failed:', e);
+    const st = $('#loginStatus'); if(st) st.textContent = 'Login error: '+(e && e.message ? e.message : e);
+   }
   },
   logout(){
     if(FIREBASE_READY && fbAuth) fbAuth.signOut().catch(()=>{});
@@ -1503,7 +1538,25 @@ const DevAccess = {
     // write needed here either now that unlocking never wrote one.
     if(State.currentUser) State.currentUser.isDeveloper = false;
     toast('Developer mode locked','ok');
-    applyViewMode(); renderSidebar(); renderPage();
+    applyViewMode();
+    // BUGFIX: this used to just call renderSidebar()+renderPage() straight
+    // away. renderPage() only ever re-renders whatever module was already
+    // open (Pages[State.activePage]()) — and every page except the
+    // dashboard renders unconditionally, with no hasPerm() check of its
+    // own (only goPage() checks that, when navigating there by clicking).
+    // So locking out while sitting on a Developer-only screen (Users &
+    // Roles, Partners & Equity, MikroTik, Module Switchboard, etc.) left
+    // that exact admin content sitting on screen — the sidebar had already
+    // switched to Simple View, but the page itself hadn't, so it visually
+    // looked like Developer Mode was still on until a manual page refresh
+    // forced everything to re-evaluate from scratch. Now: if the page that
+    // was open is no longer permitted once Developer access is gone, send
+    // them Home instead of leaving it stuck on screen.
+    if(!hasPerm(State.activePage)){
+      goPage('dashboard');
+    }else{
+      renderSidebar(); renderPage();
+    }
   }
 };
 
@@ -4554,6 +4607,12 @@ Pages.users = function(){
   const d = State.data;
   const roles = Object.keys(d.permissions);
   const isDev = !!(State.currentUser && State.currentUser.isDeveloper);
+  // Delete is also available to Admin (not just Developer) — Admins already
+  // manage roles from this same table, so removing an account they created
+  // or no longer need shouldn't require a Developer passkey. Create User and
+  // Overrides stay Developer-only since those touch account creation and
+  // per-user permission exceptions, which are more sensitive.
+  const canDelete = isDev || State.currentRole === 'Admin';
   // The standalone Developer identity (logged in via the login screen's
   // "Developer Access" link) is deliberately left out of this list — it's
   // not an Admin-assignable role (it isn't even in d.permissions/roles
@@ -4566,7 +4625,7 @@ Pages.users = function(){
         ${isDev?'<button class="btn sm" onclick="Users.openCreateForm()">+ Create User</button>':''}
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Name</th><th>Email / Username</th><th>Role</th><th>Login Type</th>${isDev?'<th></th>':''}</tr></thead>
+        <thead><tr><th>Name</th><th>Email / Username</th><th>Role</th><th>Login Type</th>${(isDev||canDelete)?'<th></th>':''}</tr></thead>
         <tbody>
           ${listedUsers.map(([uidKey,u])=>`
             <tr><td>${esc(u.name)}${u.isDeveloper?' <span class="badge active">DEV</span>':''}</td><td>${esc(u.email)}</td>
@@ -4574,7 +4633,7 @@ Pages.users = function(){
               ${roles.map(r=>`<option ${u.role===r?'selected':''}>${r}</option>`).join('')}
             </select></td>
             <td>${uidKey.startsWith('local_')?'Local (username/password)':(uidKey==='local_admin'?'Local Admin':'Google / Firebase')}</td>
-            ${isDev?`<td><button class="btn sm gray" onclick="Users.openOverrideModal('${uidKey}')">Overrides</button></td>`:''}
+            ${(isDev||canDelete)?`<td>${isDev?`<button class="btn sm gray" onclick="Users.openOverrideModal('${uidKey}')">Overrides</button> `:''}<button class="btn sm red" onclick="Users.confirmDelete('${uidKey}')">🗑 Delete</button></td>`:''}
             </tr>
           `).join('') || '<tr><td colspan="5" class="small-muted">No users</td></tr>'}
         </tbody>
@@ -4672,6 +4731,27 @@ const Users = {
     else State.data.userOverrides[uidKey][moduleKey] = (val==='allow');
     persist();
     if(State.currentUser && State.currentUser.uid===uidKey) renderSidebar();
+  },
+  // ---- Delete User (Developer only) ----
+  confirmDelete(uidKey){
+    const u = State.data.users[uidKey];
+    if(!u){ toast('User not found','err'); return; }
+    if(uidKey==='local_admin'){ toast('The built-in Administrator account cannot be deleted','err'); return; }
+    if(State.currentUser && State.currentUser.uid===uidKey){ toast('You cannot delete the account you are currently logged in as','err'); return; }
+    openModal(`
+      <div class="modal-header"><h3>🗑 Delete User</h3><button class="modal-close" onclick="closeModal()">×</button></div>
+      <p>Permanently delete <b>${esc(u.name)}</b> (${esc(u.email)})? This removes their login and any per-module overrides. This cannot be undone.</p>
+      <div class="modal-actions">
+        <button class="btn gray" onclick="closeModal()">Cancel</button>
+        <button class="btn red" onclick="Users.deleteUser('${uidKey}')">Delete User</button>
+      </div>
+    `);
+  },
+  deleteUser(uidKey){
+    delete State.data.users[uidKey];
+    if(State.data.localUsers) State.data.localUsers = State.data.localUsers.filter(x=>x.id!==uidKey);
+    if(State.data.userOverrides) delete State.data.userOverrides[uidKey];
+    persist(); toast('User deleted','ok'); closeModal(); Pages.users();
   }
 };
 
@@ -5699,9 +5779,41 @@ document.addEventListener('click', function(e){
 /* =========================================================================
    BOOTSTRAP
    ========================================================================= */
-window.addEventListener('DOMContentLoaded', ()=>{
+window.addEventListener('DOMContentLoaded', async ()=>{
   loadLocal();          // Offline-First Engine: local data (and branding) available before any network call
   applyTheme();          // paint the login screen with saved branding too, not just the post-login app
+  // BUGFIX (sync/login-mismatch): loginWithPassword() checks typed
+  // credentials against State.data.settings.localAdminUser/Pass and
+  // State.data.localUsers — but until now that only ever reflected
+  // whatever this ONE browser had cached locally, since the cloud pull
+  // only happened *after* a credential match, inside _onLogin. If a
+  // browser's local cache held stale admin credentials (e.g. changed and
+  // synced from another device since), typing the real current
+  // admin/admin123 could silently fail to match the built-in Admin path
+  // and fall through to a different local staff account that happened to
+  // share the same username/password — logging someone into a totally
+  // different identity/role with no error. Pulling the shared cloud data
+  // here, before the login screen is even usable, means the credential
+  // check itself always runs against current values on every device.
+  if(FIREBASE_READY && db){
+    try{
+      const snap = await Promise.race([
+        db.collection('businesses').doc(BUSINESS_ID).get(),
+        new Promise((_, reject)=> setTimeout(()=> reject(new Error('Boot sync timed out')), 8000))
+      ]);
+      if(snap.exists){
+        Object.assign(State.data, snap.data());
+        repairData();
+        saveLocal();
+        applyTheme();
+      }
+    }catch(e){ console.warn('Boot-time sync failed, using local cache:', e.message); }
+  }
+  const dbg = $('#loginDebug');
+  if(dbg){
+    if(FIREBASE_READY) dbg.textContent = 'Firebase: connected (project '+FIREBASE_CONFIG.projectId+') — online: '+navigator.onLine;
+    else dbg.textContent = 'Firebase: NOT connected'+(FIREBASE_INIT_ERROR ? ' — '+FIREBASE_INIT_ERROR : '')+' — running local-only';
+  }
   Auth.init();
   const tickClock = ()=>{
     const now = new Date();
