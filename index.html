@@ -2180,7 +2180,11 @@ Pages.dashboard = function(){
   const totalPendingDues = d.customers.reduce((s,c)=> s + custPendingBalance(c), 0);
   const thisMonth = monthKey(todayISO());
   const collectedThisMonth = d.recoveryPayments.filter(p=>p.month===thisMonth).reduce((s,p)=>s+Number(p.amount),0);
-  const expectedThisMonth = d.customers.filter(c=>c.status!=='Suspended').reduce((s,c)=>s+Number(c.monthlyRate||0),0);
+  // Route through custMonthDueAmount so this stays consistent with Recovery
+  // & Dues and the per-customer breakdown — a customer disconnected mid-
+  // this-month is still billed in full for that month, and new connections
+  // owe their pro-rata first-month amount, not the full monthlyRate.
+  const expectedThisMonth = d.customers.reduce((s,c)=>s+custMonthDueAmount(c, thisMonth),0);
   const cardColor = (d.settings.theme && d.settings.theme.dashboardCardColor) || '#f97316';
   // Quick-Access cards: exact same module list, permission check (hasPerm)
   // and goPage() navigation the sidebar already uses — clicking a card
@@ -2249,11 +2253,36 @@ function custMonthsSinceConnection(c){
   const start = new Date(c.connectionDate); const now = new Date();
   return Math.max(0,(now.getFullYear()-start.getFullYear())*12 + (now.getMonth()-start.getMonth()) + 1);
 }
+// SUSPENSION-AWARE BILLING — a customer that was disconnected (Simulate
+// Disconnect) should stop accruing new monthly charges while suspended,
+// instead of silently piling up dues for a service they weren't receiving.
+// The calendar month a disconnect/reconnect happens in is still billed in
+// full (no mid-month proration outside the very first connection month,
+// matching how the rest of this app already handles proration) — only
+// months that fall ENTIRELY inside a suspended period are free.
+// c.suspendedSince: date string, set while currently suspended (status==='Suspended').
+// c.suspensionHistory: [{from, to}] — closed past suspension windows, appended on Reconnect.
+function _monthAfter(mk){ const [y,m]=mk.split('-').map(Number); return monthKey(new Date(y, m, 1)); }
+function _monthBefore(mk){ const [y,m]=mk.split('-').map(Number); return monthKey(new Date(y, m-2, 1)); }
+function custIsMonthSuspended(c, mKey){
+  const periods = (c.suspensionHistory||[]).slice();
+  if(c.status==='Suspended' && c.suspendedSince) periods.push({from:c.suspendedSince, to:null});
+  for(const p of periods){
+    if(!p.from) continue;
+    const freeFrom = _monthAfter(monthKey(p.from)); // suspension month itself still billed
+    if(mKey < freeFrom) continue;
+    if(p.to == null) return true; // still suspended, open-ended — every later month is free
+    const freeTo = _monthBefore(monthKey(p.to)); // reconnect month itself still billed
+    if(mKey <= freeTo) return true;
+  }
+  return false;
+}
 // Amount owed for one specific calendar month for this customer — the first
 // month uses the stored pro-rata amount when available, all other months
-// use the full monthly rate.
+// use the full monthly rate. Months fully covered by a suspension are free.
 function custMonthDueAmount(c, mKey){
   if(mKey === 'OPENING') return Number(c.openingBalance||0);
+  if(custIsMonthSuspended(c, mKey)) return 0;
   const firstMonthKey = c.connectionDate ? monthKey(c.connectionDate) : null;
   if(mKey === firstMonthKey && c.proRataFirstMonth != null) return Number(c.proRataFirstMonth);
   return Number(c.monthlyRate||0);
@@ -2337,7 +2366,7 @@ function custMonthWiseBreakdown(c){
     const due = custMonthDueAmount(c, mk);
     const paid = custMonthPaidAmount(c, mk);
     const remaining = Math.max(0, Math.round((due-paid)*100)/100);
-    const status = paid<=0.01 ? 'Unpaid' : (paid < due-0.01 ? 'Partial' : 'Paid');
+    const status = (due===0 && custIsMonthSuspended(c, mk)) ? 'Suspended' : (paid<=0.01 ? 'Unpaid' : (paid < due-0.01 ? 'Partial' : 'Paid'));
     out.push({month:mk, due, paid, remaining, status});
     d.setMonth(d.getMonth()+1);
   }
@@ -2529,8 +2558,27 @@ const Customers = {
       materialsUsed: id ? (existing.materialsUsed||[]) : [],
       materialCost: id ? (existing.materialCost||0) : 0,
       proRataFirstMonth: id ? (existing.proRataFirstMonth ?? null) : null,
-      ledger: id ? (existing.ledger||[]) : []
+      ledger: id ? (existing.ledger||[]) : [],
+      // Carry these over by default; the status-transition block below
+      // overrides them when the Status dropdown itself is what changed.
+      suspendedSince: id ? (existing.suspendedSince ?? null) : null,
+      suspensionHistory: id ? (existing.suspensionHistory ? existing.suspensionHistory.slice() : []) : []
     };
+    // Keep suspension tracking consistent even when staff change Status
+    // from this plain dropdown instead of using Simulate Disconnect /
+    // Reconnect — otherwise billing either silently keeps accruing during
+    // a manually-set Suspended status, or a manually-cleared Suspended
+    // status leaves a dangling suspendedSince that (since it no longer
+    // matches status==='Suspended') erases the suspension window instead
+    // of closing it, retroactively re-billing months that were free.
+    if(id && existing && existing.status!=='Suspended' && rec.status==='Suspended'){
+      if(!rec.suspendedSince) rec.suspendedSince = todayISO();
+    } else if(id && existing && existing.status==='Suspended' && rec.status!=='Suspended'){
+      if(rec.suspendedSince){
+        rec.suspensionHistory.push({from:rec.suspendedSince, to:todayISO()});
+        rec.suspendedSince = null;
+      }
+    }
     if(!rec.name){ toast('Name is required','err'); return; }
     if(id){
       const idx = State.data.customers.findIndex(x=>x.id===id);
@@ -2671,6 +2719,8 @@ const Customers = {
       <div class="grid grid-3" style="margin-top:10px;">
         <div class="card" style="grid-column:span 2;">
           <div class="section-title">${esc(c.name)} <span class="badge ${(c.status||'Active').toLowerCase()}">${c.status||'Active'}</span></div>
+          ${c.status==='Suspended' && c.suspendedSince ? `<div class="small-muted" style="color:var(--red);margin-top:2px;">⛔ Suspended since ${fmtDate(c.suspendedSince)} — no monthly charges accruing while disconnected</div>` : ''}
+          ${(c.suspensionHistory && c.suspensionHistory.length) ? `<div class="small-muted" style="margin-top:2px;">🕓 Past suspension${c.suspensionHistory.length>1?'s':''}: ${c.suspensionHistory.map(p=>fmtDate(p.from)+' – '+fmtDate(p.to)).join(', ')}</div>` : ''}
           <button class="btn sm gray" id="profileDetailsToggleBtn" onclick="Customers.toggleProfileDetails()" style="margin:6px 0;">${State._profileDetailsOpen ? '🔼 Hide Details' : '🔍 Show Details'}</button>
           <div class="grid grid-2" id="profileDetailsBody" style="${State._profileDetailsOpen ? '' : 'display:none;'}">
             <div class="small-muted">📞 ${esc(c.phone||'-')}</div>
@@ -2716,13 +2766,13 @@ const Customers = {
           <thead><tr><th>Month</th><th>Due</th><th>Paid</th><th>Status</th><th></th></tr></thead>
           <tbody>
             ${custMonthWiseBreakdown(c).map(b=>{
-              const badgeClass = b.status==='Paid' ? 'active' : (b.status==='Partial' ? 'suspended' : 'expired');
+              const badgeClass = b.status==='Paid' ? 'active' : (b.status==='Suspended' ? 'suspended' : (b.status==='Partial' ? 'suspended' : 'expired'));
               return `<tr>
                 <td>${monthOrOpeningLabel(b.month)}</td>
                 <td>${fmtMoney(b.due)}</td>
                 <td>${fmtMoney(b.paid)}</td>
                 <td><span class="badge ${badgeClass}">${b.status}</span></td>
-                <td>${b.status!=='Paid' ? `<button class="btn sm green" onclick="Recovery.openPaymentForMonth('${c.id}','${b.month}')">Pay</button>` : ''}</td>
+                <td>${(b.status!=='Paid' && b.status!=='Suspended') ? `<button class="btn sm green" onclick="Recovery.openPaymentForMonth('${c.id}','${b.month}')">Pay</button>` : ''}</td>
               </tr>`;
             }).join('') || '<tr><td colspan="5" class="small-muted">No billing history yet</td></tr>'}
           </tbody>
@@ -3671,15 +3721,20 @@ Pages.recovery = function(){
     $('#recTableTitle').textContent = allMonths ? '💰 Recovery & Dues — All Months (Cumulative)' : '💰 Recovery & Dues — '+monthLabel(month+'-01');
     const dueLabel = allMonths ? 'Total Due' : 'Due';
 
-    const active = d.customers.filter(c=>c.status!=='Suspended');
+    // NOTE: deliberately NOT filtering out Suspended customers here — a
+    // customer disconnected mid-this-month is still billed in full for
+    // that month (see custIsMonthSuspended), so excluding them would
+    // undercount Expected for exactly the month it matters most. Route
+    // through custMonthDueAmount/custTotalBilled everywhere so this stat
+    // can never drift from what each customer row actually shows.
     let expected, collected, dueFn, paidFn;
     if(allMonths){
-      expected = active.reduce((s,c)=>s+custTotalBilled(c),0);
-      collected = active.reduce((s,c)=>s+custTotalPaid(c),0);
+      expected = d.customers.reduce((s,c)=>s+custTotalBilled(c),0);
+      collected = d.customers.reduce((s,c)=>s+custTotalPaid(c),0);
       dueFn = c=>custPendingBalance(c);
       paidFn = c=>custTotalPaid(c);
     }else{
-      expected = active.reduce((s,c)=>s+Number(c.monthlyRate||0),0);
+      expected = d.customers.reduce((s,c)=>s+custMonthDueAmount(c, month),0);
       collected = d.recoveryPayments.filter(p=>p.month===month).reduce((s,p)=>s+Number(p.amount),0);
       dueFn = c=>custMonthDueAmount(c, month);
       paidFn = c=>custMonthPaidAmount(c, month);
@@ -3695,16 +3750,20 @@ Pages.recovery = function(){
     ).map(c=>{
       const due = dueFn(c);
       const paid = paidFn(c);
-      const status = paid <= 0 ? 'Unpaid' : (paid < due-0.01 ? 'Partial' : 'Paid');
+      // A currently-suspended customer with 0 due for this month isn't
+      // "Unpaid" (nothing was billed) — label it distinctly so staff don't
+      // chase a payment that was never owed.
+      const status = (!allMonths && due===0 && custIsMonthSuspended(c, month)) ? 'Suspended'
+        : (paid <= 0 ? 'Unpaid' : (paid < due-0.01 ? 'Partial' : 'Paid'));
       return {c, due, paid, status};
     }).filter(x=>{
       if(stFilter==='Paid') return x.status==='Paid';
-      if(stFilter==='Unpaid') return x.status!=='Paid';
+      if(stFilter==='Unpaid') return x.status!=='Paid' && x.status!=='Suspended';
       return true;
     });
 
     $('#billingBody').innerHTML = rows.map(({c,due,paid,status})=>{
-      const badgeClass = status==='Paid' ? 'active' : (status==='Partial' ? 'suspended' : 'expired');
+      const badgeClass = status==='Paid' ? 'active' : (status==='Suspended' ? 'suspended' : (status==='Partial' ? 'suspended' : 'expired'));
       const grace = c.graceUntil ? ` <span class="small-muted">(grace until ${fmtDate(c.graceUntil)})</span>` : '';
       const fields = icField(null, `<span class="f title"><a href="javascript:void(0)" onclick="Customers.openProfile('${c.id}')" style="color:var(--accent);">${esc(c.name)}</a></span>`)
         + icField(dueLabel, fmtMoney(due)) + icField('Paid', fmtMoney(paid))
@@ -3971,7 +4030,14 @@ const Recovery = {
     if(!c){ toast('User not found','err'); return; }
     const unpaid = custUnpaidMonthsList(c);
     const targetMonth = unpaid.length ? unpaid[0].month : monthKey(todayISO());
-    const amount = unpaid.length ? unpaid[0].remaining : Number(c.monthlyRate||0);
+    // BUGFIX: was Number(c.monthlyRate||0) as the fallback amount when
+    // there's no unpaid month on record — but that skips custMonthDueAmount
+    // entirely, so a currently-suspended customer with a clean ledger would
+    // get charged the full rate for today's (suspended, actually-free)
+    // month by this single tap. Route through the same due calculation
+    // every other collection path uses, so "no outstanding balance" really
+    // means zero, suspended or not.
+    const amount = unpaid.length ? unpaid[0].remaining : custMonthDueAmount(c, targetMonth);
     if(amount<=0){ toast(c.name+' has no outstanding balance','ok'); return; }
     const date = todayISO();
     const collector = State.currentUser ? State.currentUser.name : '-';
@@ -4014,6 +4080,10 @@ const Recovery = {
     if(!c) return;
     if(!confirm('Simulate disconnect for '+c.name+'? This sets their status to Suspended.')) return;
     c.status = 'Suspended';
+    // Mark the start of this suspension window so billing stops accruing
+    // for full calendar months from here on (see custIsMonthSuspended).
+    // Guard against double-setting if already suspended for some reason.
+    if(!c.suspendedSince) c.suspendedSince = todayISO();
     const mtLive = State.data.settings.mikrotikIntegration && State.data.settings.mikrotikIntegration.liveSync;
     if(mtLive && c.pppoeUsername){
       fbFunctions.httpsCallable('controlMikrotikSecret')({ ...MikroTik._authPayload(), secretName:c.pppoeUsername, enable:false })
@@ -4036,6 +4106,14 @@ const Recovery = {
   reconnect(customerId){
     const c = State.data.customers.find(x=>x.id===customerId);
     if(!c) return;
+    // Close out the suspension window that was opened by Simulate Disconnect
+    // so the free (unbilled) months get locked in permanently, then clear
+    // suspendedSince so future months bill normally again.
+    if(c.suspendedSince){
+      c.suspensionHistory = c.suspensionHistory || [];
+      c.suspensionHistory.push({from:c.suspendedSince, to:todayISO()});
+      c.suspendedSince = null;
+    }
     c.status = 'Active'; c.graceUntil = null;
     const mtLive = State.data.settings.mikrotikIntegration && State.data.settings.mikrotikIntegration.liveSync;
     if(mtLive && c.pppoeUsername){
@@ -4416,6 +4494,20 @@ const ExcelIO = {
           // actually present in the file (column absent => leave untouched,
           // same behavior as every other optional column above).
           if(idxPending>-1) patch.openingBalance = Number(r[idxPending])||0;
+          // Same suspension-tracking consistency as the manual Edit User
+          // form: a bulk CSV update that flips an existing customer's
+          // Status to/from Suspended must also open/close a suspension
+          // window, or billing silently resumes accruing for a suspended
+          // row (or a stale window gets erased instead of closed).
+          if(existing && existing.status!=='Suspended' && patch.status==='Suspended'){
+            if(!existing.suspendedSince) patch.suspendedSince = todayISO();
+          } else if(existing && existing.status==='Suspended' && patch.status!=='Suspended'){
+            if(existing.suspendedSince){
+              patch.suspensionHistory = (existing.suspensionHistory||[]).slice();
+              patch.suspensionHistory.push({from:existing.suspendedSince, to:todayISO()});
+              patch.suspendedSince = null;
+            }
+          }
           // Device/DeviceQty — records historical "this customer already has
           // this device" assignments (device TYPE + quantity, matching how
           // the rest of the app already tracks materialsUsed — no serial
@@ -4743,6 +4835,20 @@ const MikroTik2 = {
     const custId = $('#'+selId).value;
     const c = State.data.customers.find(x=>x.id===custId);
     if(!c) return;
+    // Same suspension-window bookkeeping as Simulate Disconnect/Reconnect
+    // and the Edit User form — this button is a third, independent path
+    // to Active/Suspended and was bypassing it entirely, which would have
+    // silently reintroduced the "suspended customer keeps getting billed"
+    // bug for anyone disabled from here instead of the Recovery page.
+    if(c.status!=='Suspended' && status==='Suspended'){
+      if(!c.suspendedSince) c.suspendedSince = todayISO();
+    } else if(c.status==='Suspended' && status!=='Suspended'){
+      if(c.suspendedSince){
+        c.suspensionHistory = c.suspensionHistory || [];
+        c.suspensionHistory.push({from:c.suspendedSince, to:todayISO()});
+        c.suspendedSince = null;
+      }
+    }
     c.status = status;
     MikroTik2.logConsole('Manual Override', c.name+' (PPPoE: '+(c.pppoeUsername||'—')+') set to '+status);
     persist(); toast(c.name+' set to '+status+' (manual)','ok'); Pages.settings();
