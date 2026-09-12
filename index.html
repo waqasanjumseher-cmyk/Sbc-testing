@@ -2041,8 +2041,15 @@ function computeOperatingCashflow(range){
   // post the package-price portion straight to 'Recovery' and only the
   // amount above the package price to 'New Connection Revenue'), so no
   // separate new-connection carve-out is needed here anymore.
+  // Opening Balance (legacy pre-system dues) payments are deliberately
+  // EXCLUDED here — they're always old debt by definition (see
+  // recoveryAppliedMonth: OPENING sorts before every real month), and
+  // already counted once under commCf.receivedPendingDues in the
+  // Commercial Cumulative section. Including them here too would double
+  // -count the same cash under both "Total Recoveries" (this card) and
+  // "Pending Dues Received" (the other split-section) at once.
   const totalRecoveries = d.profitLedger
-    .filter(x=>x.type==='income' && x.category==='Recovery' && inMonth(x.date))
+    .filter(x=>x.type==='income' && x.category==='Recovery' && inMonth(x.date) && recoveryAppliedMonth(x)!=='0000-00')
     .reduce((s,x)=>s+Number(x.amount||0),0);
   const totalBizExpenses = d.profitLedger
     .filter(x=>x.type==='expense' && BIZ_EXPENSE_CATEGORIES.includes(x.category) && inMonth(x.date))
