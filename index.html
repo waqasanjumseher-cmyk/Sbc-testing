@@ -365,6 +365,18 @@ tr:hover td{background:#f8fafc;}
 }
 .field input:focus,.field select:focus,.field textarea:focus{outline:none;border-color:var(--accent);}
 .field-full{grid-column:1/-1;}
+/* Requirement — Users & Roles tab: table text should read plain black,
+   not the app-wide dark-blue --text-dark it was inheriting. Scoped to
+   .users-tab so no other page's tables are affected. */
+.users-tab table td,.users-tab table th{color:#000;}
+/* Requirement — Stock Purchase / Edit Purchase form: readability bump of
+   +1px over the shared .field font-size (12px -> 13px). Scoped to
+   .purchase-modal so no other form/modal in the app is affected. Applies
+   to the dealer/date/batch/notes/extra-expenses fields AND the dynamic
+   "Add Items" rows, since those rows are appended inside this same
+   wrapper (#purchaseItemRows) at runtime. */
+.purchase-modal .field label{font-size:12px;}
+.purchase-modal .field input,.purchase-modal .field select,.purchase-modal .field textarea{font-size:13px;}
 
 /* Accessible theme for the New Connection ("New User") setup forms — both
    the simple form and the Advanced Setup form — for staff with weak
@@ -522,7 +534,7 @@ tr:hover td{background:#f8fafc;}
    flex-grow and shrinking the fixed-width columns (serial/amount/buttons)
    down to only what they actually need. Font size reduced slightly and
    colour set to dark blue per latest request. */
-.rec-simple-row .rec-name{flex:1 1 auto;min-width:0;font-weight:600;font-size:14px;overflow-wrap:anywhere;color:var(--text-dark);}
+.rec-simple-row .rec-name{flex:1 1 auto;min-width:0;font-weight:600;font-size:13px;overflow-wrap:anywhere;color:var(--text-dark);}
 .rec-simple-row .rec-name a{color:var(--text-dark);text-decoration:none;}
 .rec-simple-row .rec-amt{flex:none;min-width:50px;text-align:right;font-weight:700;font-size:14px;}
 /* Requirement — action buttons stacked tightly, one over the other, pinned
@@ -2483,7 +2495,7 @@ Pages.dashboard = function(){
   const activeCustomers = d.customers.filter(c=>c.status==='Active').length;
   const totalPendingDues = d.customers.reduce((s,c)=> s + custPendingBalance(c), 0);
   const thisMonth = monthKey(todayISO());
-  const collectedThisMonth = d.recoveryPayments.filter(p=>p.month===thisMonth).reduce((s,p)=>s+Number(p.amount),0);
+  const collectedThisMonth = d.recoveryPayments.filter(p=>p.month===thisMonth).reduce((s,p)=>s+paymentCashAmount(p),0);
   // Route through custMonthDueAmount so this stays consistent with Recovery
   // & Dues and the per-customer breakdown — a customer disconnected mid-
   // this-month is still billed in full for that month, and new connections
@@ -2593,6 +2605,22 @@ function custMonthDueAmount(c, mKey){
 }
 function custMonthPaidAmount(c, mKey){
   return State.data.recoveryPayments.filter(p=>p.customerId===c.id && p.month===mKey).reduce((s,p)=>s+Number(p.amount),0);
+}
+// BUGFIX — a recoveryPayments record's `amount` is the total allocated to
+// the month (cash + discount, see Recovery._commit), which is correct for
+// due-settlement math above (a discount still clears what's owed). But it
+// is NOT cash in hand, so any stat that reports actual money recovered
+// ("Collected"/"Amount Collected"/"Total Recovered") must strip the
+// discount portion back out — otherwise a discounted payment inflates the
+// recovered total by money that was never received. Use these wherever a
+// cash total is shown; leave custMonthPaidAmount/custTotalPaid untouched
+// since due-tracking must keep counting the discount as settled.
+function paymentCashAmount(p){
+  return Number(p.amount||0) - Number(p.discount||0);
+}
+function custTotalCashRecovered(c){
+  return State.data.recoveryPayments.filter(p=>p.customerId===c.id).reduce((s,p)=>s+paymentCashAmount(p),0)
+       + (c.ledger||[]).filter(l=>l.type==='credit').reduce((s,l)=>s+Number(l.amount),0);
 }
 function custTotalBilled(c){
   const months = custMonthsSinceConnection(c);
@@ -3806,6 +3834,7 @@ const Dealers = {
     const opts = State.data.dealers.map(d=>`<option value="${d.id}">${esc(d.name)}</option>`).join('');
     const itemOpts = State.data.inventory.map(i=>`<option value="${i.id}">${esc(i.name)}</option>`).join('');
     openModal(`
+      <div class="purchase-modal">
       <div class="modal-header"><h3>Stock Purchase</h3><button class="modal-close" onclick="closeModal()">×</button></div>
       <div class="form-grid">
         <div class="field"><label>Dealer</label><select id="f_pdealer">${opts}</select></div>
@@ -3823,6 +3852,7 @@ const Dealers = {
         <button class="btn gray" onclick="closeModal()">Cancel</button>
         <button class="btn" onclick="Dealers.savePurchase()">Save Purchase</button>
       </div>
+      </div>
     `);
     Dealers._purchaseItemOpts = itemOpts;
     Dealers._addPurchaseRow();
@@ -3838,6 +3868,7 @@ const Dealers = {
     const opts = State.data.dealers.map(d=>`<option value="${d.id}" ${d.id===pur.dealerId?'selected':''}>${esc(d.name)}</option>`).join('');
     const itemOpts = State.data.inventory.map(i=>`<option value="${i.id}">${esc(i.name)}</option>`).join('');
     openModal(`
+      <div class="purchase-modal">
       <div class="modal-header"><h3>Edit Purchase</h3><button class="modal-close" onclick="closeModal()">×</button></div>
       <div class="form-grid">
         <div class="field"><label>Dealer</label><select id="f_pdealer">${opts}</select></div>
@@ -3854,6 +3885,7 @@ const Dealers = {
       <div class="modal-actions">
         <button class="btn gray" onclick="closeModal()">Cancel</button>
         <button class="btn" onclick="Dealers.saveEditedPurchase('${purId}')">Save Changes</button>
+      </div>
       </div>
     `);
     Dealers._purchaseItemOpts = itemOpts;
@@ -4487,12 +4519,12 @@ Pages.recovery = function(){
     let expected, collected, dueFn, paidFn;
     if(allMonths){
       expected = d.customers.reduce((s,c)=>s+custTotalBilled(c),0);
-      collected = d.customers.reduce((s,c)=>s+custTotalPaid(c),0);
+      collected = d.customers.reduce((s,c)=>s+custTotalCashRecovered(c),0);
       dueFn = c=>custPendingBalance(c);
       paidFn = c=>custTotalPaid(c);
     }else{
       expected = d.customers.reduce((s,c)=>s+custMonthDueAmount(c, month),0);
-      collected = d.recoveryPayments.filter(p=>p.month===month).reduce((s,p)=>s+Number(p.amount),0);
+      collected = d.recoveryPayments.filter(p=>p.month===month).reduce((s,p)=>s+paymentCashAmount(p),0);
       dueFn = c=>custMonthDueAmount(c, month);
       paidFn = c=>custMonthPaidAmount(c, month);
     }
@@ -4929,10 +4961,10 @@ const Recovery = {
     let expected, collected;
     if(allMonths){
       expected = d.customers.reduce((s,x)=>s+custTotalBilled(x),0);
-      collected = d.customers.reduce((s,x)=>s+custTotalPaid(x),0);
+      collected = d.customers.reduce((s,x)=>s+custTotalCashRecovered(x),0);
     }else{
       expected = d.customers.reduce((s,x)=>s+custMonthDueAmount(x, month),0);
-      collected = d.recoveryPayments.filter(p=>p.month===month).reduce((s,p)=>s+Number(p.amount),0);
+      collected = d.recoveryPayments.filter(p=>p.month===month).reduce((s,p)=>s+paymentCashAmount(p),0);
     }
     recStats.innerHTML = `
       <div class="card stat-card"><div class="lbl">${allMonths?'Total Billed — All Time':'Expected'}</div><div class="val">${fmtMoney(expected)}</div></div>
@@ -6865,6 +6897,7 @@ Pages.users = function(){
   roles.forEach(r=> roleCounts[r]=0);
   listedUsers.forEach(([,u])=>{ if(roleCounts[u.role]==null) roleCounts[u.role]=0; roleCounts[u.role]++; });
   $('#pageContent').innerHTML = `
+    <div class="users-tab">
     <div class="search-bar">
     </div>
     <div class="grid grid-3" style="margin-bottom:10px;">
@@ -6906,6 +6939,7 @@ Pages.users = function(){
           `).join('')}
         </tbody>
       </table></div>
+    </div>
     </div>
   `;
 };
