@@ -6105,7 +6105,7 @@ function isCurrentMonth(dateStr){
   const d = new Date(dateStr), now = new Date();
   return d.getFullYear()===now.getFullYear() && d.getMonth()===now.getMonth();
 }
-const BIZ_EXPENSE_CATEGORIES = ['Tower Rent','Monthly Data Bill','Steel Wire','Refreshment','Others'];
+const BIZ_EXPENSE_CATEGORIES = ['Tower Rent','Monthly Data Bill','Petrol','Refreshment','Others'];
 // Tower Rent and Monthly Data Bill are fixed monthly costs — never
 // editable, always exactly Rs. 5,000 / Rs. 15,000 respectively regardless
 // of what's typed into the Amount field. Every other category keeps a
