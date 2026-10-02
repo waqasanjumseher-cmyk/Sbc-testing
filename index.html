@@ -578,9 +578,13 @@ tr:hover td{background:#f8fafc;}
   display:none;align-items:center;justify-content:center;padding:0;
 }
 .search-clear-btn:hover{background:#94a3b8;}
+/* BUGFIX: the (x) is a <button> inside .search-bar, so the Recovery bar's
+   "width:100%" rule for its buttons used to stretch it across the whole
+   input and hide what was typed. Pin its size so no container rule can. */
+.search-input-wrap .search-clear-btn{width:18px!important;min-width:18px!important;height:18px!important;margin:0!important;padding:0!important;}
 .recovery-sticky-bar .search-bar input,
 .recovery-sticky-bar .search-bar select,
-.recovery-sticky-bar .search-bar button,
+.recovery-sticky-bar .search-bar button:not(.search-clear-btn),
 .recovery-sticky-bar .search-bar .search-input-wrap{
   width:100%;margin:0;min-width:0;
 }
@@ -1115,16 +1119,20 @@ const $$ = sel => Array.from(document.querySelectorAll(sel));
 function uid(prefix){ return (prefix||'id')+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
 function fmtMoney(n){ n = Number(n)||0; return 'Rs. '+n.toLocaleString('en-PK',{maximumFractionDigits:0}); }
 function fmtDate(d){ if(!d) return '-'; const dt = new Date(d); return dt.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'}); }
-function todayISO(){ return new Date().toISOString().slice(0,10); }
+// BUGFIX: toISOString() is UTC, so between 00:00-05:00 in UTC+5 (Pakistan)
+// "today" came back as YESTERDAY (and on the 1st, as the previous MONTH).
+// localISO() formats the device's own calendar date instead.
+function localISO(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function todayISO(){ return localISO(new Date()); }
 // Used as the default "From" date on every collapsible date-range report
 // (Sales/Purchases/Recovery/Expenses/etc.) so a report opened for the first
 // time on a given page shows a useful recent window instead of only "since
 // the 1st of this calendar month" — the old default silently hid any
 // purchase/sale/collection made in a previous month until the user manually
 // widened the range, which is what made those records look "missing".
-function daysAgoISO(n){ const d = new Date(); d.setDate(d.getDate()-n); return d.toISOString().slice(0,10); }
+function daysAgoISO(n){ const d = new Date(); d.setDate(d.getDate()-n); return localISO(d); }
 function monthLabel(d){ const dt=new Date(d); return dt.toLocaleDateString('en-US',{month:'long',year:'numeric'}); }
-function monthKey(d){ const dt=new Date(d); return dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0'); }
+function monthKey(d){ if(typeof d==='string' && /^\d{4}-\d{2}-\d{2}$/.test(d)) return d.slice(0,7); const dt=new Date(d); return dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0'); }
 // 'OPENING' is a virtual pseudo-month key (not a real calendar month) used
 // to make a customer's legacy openingBalance a selectable, collectible line
 // in the payment target-month dropdowns/lists, same as any real month —
@@ -1524,6 +1532,9 @@ function repairData(){
   // empty until the client adds their own Router-category items.
   if(!Array.isArray(State.data.inventory)) State.data.inventory = [];
 }
+// Firestore throws "Unsupported field value: undefined" on a full-document
+// set(); one stray undefined field anywhere would block ALL cloud sync.
+function cloudSafe(){ return JSON.parse(JSON.stringify(State.data)); }
 function saveLocal(){
   try{ localStorage.setItem(LS_KEY, JSON.stringify(State.data)); }catch(e){ console.warn('local save failed', e); }
 }
@@ -1534,14 +1545,14 @@ function persist(){
   renderSidebar(); // reflect settings/perm changes quickly
   if(FIREBASE_READY && db){
     clearTimeout(_saveTimer);
-    $('#syncDot').classList.remove('off'); $('#syncText').textContent = 'Syncing…';
+    $('#syncDot') && $('#syncDot').classList.remove('off'); $('#syncText') && ($('#syncText').textContent = 'Syncing…');
     _saveTimer = setTimeout(()=>{
-      db.collection('businesses').doc(BUSINESS_ID).set(State.data, {merge:false})
-        .then(()=>{ LAST_SYNCED_AT = new Date(); $('#syncText').textContent='Synced'; })
-        .catch(err=>{ $('#syncDot').classList.add('off'); $('#syncText').textContent='Sync error'; LAST_SYNC_ERROR = (err&&err.code?err.code+': ':'')+(err&&err.message?err.message:err); console.error(err); });
+      db.collection('businesses').doc(BUSINESS_ID).set(cloudSafe(), {merge:false})
+        .then(()=>{ LAST_SYNCED_AT = new Date(); $('#syncText') && ($('#syncText').textContent='Synced'); })
+        .catch(err=>{ $('#syncDot') && $('#syncDot').classList.add('off'); $('#syncText') && ($('#syncText').textContent='Sync error'); LAST_SYNC_ERROR = (err&&err.code?err.code+': ':'')+(err&&err.message?err.message:err); console.error(err); });
     }, 600);
   }else{
-    $('#syncDot').classList.add('off'); $('#syncText').textContent='Local only';
+    $('#syncDot') && $('#syncDot').classList.add('off'); $('#syncText') && ($('#syncText').textContent='Local only');
   }
 }
 
@@ -1568,7 +1579,7 @@ function attachFirestoreListener(){
       $('#syncDot').classList.remove('off'); $('#syncText').textContent='Synced';
     }else{
       // first run — push local/default up
-      db.collection('businesses').doc(BUSINESS_ID).set(State.data);
+      db.collection('businesses').doc(BUSINESS_ID).set(cloudSafe());
     }
   }, err=>{
     console.error('Firestore listen error', err);
@@ -2336,7 +2347,9 @@ function recoveryAppliedMonth(entry){
 // behavior is completely unchanged.
 function computeOperatingCashflow(range){
   const d = State.data;
-  const mk = monthKey(todayISO());
+  // range.month ('YYYY-MM') only changes WHICH month is evaluated (used by the
+  // Dashboard's month picker); the filtering/summing below is untouched.
+  const mk = (range && range.month) || monthKey(todayISO());
   let inMonth = dateStr => monthKey(dateStr)===mk;
   if(range && range.from && range.to){
     const from = new Date(range.from), to = new Date(range.to);
@@ -2411,6 +2424,12 @@ function computeCommercialCumulative(range){
 
   return { itemSales, connectionSales, totalSales, receivedPendingDues, totalPurchases, netCommercialBalance };
 }
+// Month picker for the Net Cash card's monthly column — view-only; picking a
+// past month just re-runs the same computeOperatingCashflow() for that month.
+Pages.setCashMonth = function(m){
+  State._cashMonth = (m && m!==monthKey(todayISO())) ? m : null;
+  Pages.dashboard();
+};
 Pages.toggleNetCashSplit = function(){
   State._netCashSplitOpen = !State._netCashSplitOpen;
   Pages.dashboard();
@@ -2428,9 +2447,15 @@ Pages.dashboard = function(){
   if(isSimpleView()){
     const cardColor = (d.settings.theme && d.settings.theme.dashboardCardColor) || '#f97316';
     const cardTextColor = '#1e3a8a'; // dark blue — readable against the orange-tinted card backgrounds
-    const opCf = computeOperatingCashflow();
+    const curMk = monthKey(todayISO());
+    const pickedMk = State._cashMonth || curMk;
+    const opCf = computeOperatingCashflow(pickedMk===curMk ? undefined : {month:pickedMk});
     const commCf = computeCommercialCumulative();
     const opLabel = monthLabel(opCf.mk+'-01');
+    const cashMonthSet = new Set([curMk]);
+    [].concat(d.profitLedger||[]).forEach(x=>{ if(x.date) cashMonthSet.add(monthKey(x.date)); });
+    cashMonthSet.add(pickedMk);
+    const cashMonthOpts = Array.from(cashMonthSet).sort().reverse().map(m=>`<option value="${m}" ${m===pickedMk?'selected':''}>${monthLabel(m+'-01')}</option>`).join('');
     const opShare = partnerSplitDisplay(opCf.netOperatingCash);
     const commShare = partnerSplitDisplay(commCf.netCommercialBalance);
     const simpleCards = orderedDashboardCards().filter(c=>hasPerm(c.key));
@@ -2444,7 +2469,7 @@ Pages.dashboard = function(){
         <div class="cc-body">
           <div class="card-split-view">
             <div class="split-section">
-              <div class="ss-title">${opLabel}</div>
+              <div class="ss-title"><select aria-label="Select month" onchange="Pages.setCashMonth(this.value)" style="width:100%;font:inherit;font-weight:700;letter-spacing:inherit;text-transform:inherit;color:inherit;background:transparent;border:1px solid var(--border);border-radius:6px;padding:2px 4px;">${cashMonthOpts}</select></div>
               ${State._cashflowDetailsOpen ? `
               <div class="ss-line"><span>Total Recoveries</span><b>${fmtMoney(opCf.totalRecoveries)}</b></div>
               <div class="ss-line"><span>Business Expenses</span><b style="color:var(--red);">−${fmtMoney(opCf.totalBizExpenses)}</b></div>
@@ -2629,7 +2654,7 @@ function custTotalBilled(c){
   let total = Number(c.materialCost||0) + Number(c.openingBalance||0);
   for(let i=0;i<months;i++){
     total += custMonthDueAmount(c, monthKey(d));
-    d.setMonth(d.getMonth()+1);
+    d.setDate(1); d.setMonth(d.getMonth()+1); // setDate(1) first: avoids 31st->next-next-month overflow
   }
   return total;
 }
@@ -2673,7 +2698,7 @@ function custUnpaidMonthsList(c){
     const due = custMonthDueAmount(c, mk);
     const paid = custMonthPaidAmount(c, mk);
     if(paid < due - 0.01) out.push({month:mk, due, paid, remaining: Math.round((due-paid)*100)/100});
-    d.setMonth(d.getMonth()+1);
+    d.setDate(1); d.setMonth(d.getMonth()+1); // setDate(1) first: avoids 31st->next-next-month overflow
   }
   return out; // chronological order = oldest first
 }
@@ -2703,7 +2728,7 @@ function custMonthWiseBreakdown(c){
     // default instead of misleadingly flagging it "Unpaid" forever.
     const status = due===0 ? (custIsMonthSuspended(c, mk) ? 'Suspended' : 'Paid') : (paid<=0.01 ? 'Unpaid' : (paid < due-0.01 ? 'Partial' : 'Paid'));
     out.push({month:mk, due, paid, remaining, status});
-    d.setMonth(d.getMonth()+1);
+    d.setDate(1); d.setMonth(d.getMonth()+1); // setDate(1) first: avoids 31st->next-next-month overflow
   }
   return out; // chronological order = oldest first
 }
@@ -4464,7 +4489,7 @@ Pages.recovery = function(){
     if(!c.connectionDate) return;
     const months = custMonthsSinceConnection(c);
     let dt = new Date(c.connectionDate);
-    for(let i=0;i<months;i++){ monthSet.add(monthKey(dt)); dt.setMonth(dt.getMonth()+1); }
+    for(let i=0;i<months;i++){ monthSet.add(monthKey(dt)); dt.setDate(1); dt.setMonth(dt.getMonth()+1); }
   });
   monthSet.add(monthKey(todayISO()));
   const monthOptions = Array.from(monthSet).sort();
@@ -4492,6 +4517,7 @@ Pages.recovery = function(){
     </div>
     <div class="card" style="margin-top:10px;">
       <div class="section-title" id="recTableTitle">💰 Recovery &amp; Dues</div>
+      <div id="recCashNote"></div>
       <div id="billingBody" class="item-card-list"></div>
     </div>
   `;
@@ -4534,6 +4560,7 @@ Pages.recovery = function(){
       <div class="card stat-card accent-red"><div class="lbl">${allMonths?'Grand Total Pending — All Months':'Total Pending — '+monthLabel(month+'-01')}</div><div class="val">${fmtMoney(Math.max(0,expected-collected))}</div></div>
     `;
 
+    const cashNoteEl = $('#recCashNote'); if(cashNoteEl) cashNoteEl.innerHTML = recCashNoteHtml(month);
     const rows = d.customers.filter(c=>
       !q || (c.name||'').toLowerCase().includes(q) || (c.phone||'').includes(q) || c.id.includes(q)
     ).map(c=>{
@@ -4582,6 +4609,32 @@ Pages.recovery = function(){
 // the Pending Dues sidebar/dashboard entry stays (so nothing referencing
 // goPage('pending') breaks) but renders the exact same merged view.
 Pages.pending = Pages.recovery;
+// Explains (display only, no totals changed) why the Recovery tab's
+// "Collected" and the dashboard's Net Cash "Total Recoveries" can differ:
+// Collected = payments made FOR that month's bills (any date); Net Cash =
+// cash actually RECEIVED in that month (any bill). This reuses Net Cash's
+// own filter and splits it so the two figures can be reconciled on screen.
+function recCashNoteHtml(month){
+  if(!month || month==='ALL') return '';
+  let total=0, own=0, older=0, adv=0, early=0;
+  State.data.profitLedger.forEach(x=>{
+    if(x.type!=='income' || x.category!=='Recovery') return;
+    const am = recoveryAppliedMonth(x);
+    if(am==='0000-00') return;
+    const a = Number(x.amount||0);
+    const isAdv = /^Advance\/overpayment/.test(x.note||'');
+    if(monthKey(x.date)===month){
+      total += a;
+      if(isAdv) adv += a; else if(am===month) own += a; else older += a;
+    }else if(!isAdv && am===month){ early += a; }
+  });
+  const f = fmtMoney;
+  return `<div style="font-size:11px;line-height:1.6;padding:6px 2px 10px;color:var(--text-mid);">
+    💵 <b>Cash received in ${monthLabel(month+'-01')}: ${f(total)}</b> (this is what Net Cash shows)<br>
+    &nbsp;&nbsp;• for ${monthLabel(month+'-01')} bills: ${f(own)} &nbsp;• older months' dues: ${f(older)} &nbsp;• advance / extra: ${f(adv)}<br>
+    ${early>0.01 ? `&nbsp;&nbsp;• plus ${f(early)} paid in another month for ${monthLabel(month+'-01')} bills (counted in Collected only)<br>` : ''}
+    <span class="small-muted">"Collected" above counts only payments made for ${monthLabel(month+'-01')} bills.</span></div>`;
+}
 const Recovery = {
   // New Collection Form, general entry point (not tied to a row): pick any
   // customer from a dropdown, and their outstanding balance / package
@@ -4668,8 +4721,8 @@ const Recovery = {
       </div>
       <div class="form-grid">
         ${targetSelect}
-        <div class="field"><label>Amount Received</label><input type="number" id="f_recamt" value="${suggestedAmt}" oninput="Recovery.updatePaymentPreview('${customerId}')"></div>
-        <div class="field"><label>Discount</label><input type="number" id="f_recdiscount" placeholder="0" oninput="Recovery.updatePaymentPreview('${customerId}')"></div>
+        <div class="field"><label>Amount Received</label><input type="number" id="f_recamt" value="${suggestedAmt}" oninput="this.dataset.touched='1';Recovery.updatePaymentPreview('${customerId}')"></div>
+        <div class="field"><label>Discount</label><input type="number" id="f_recdiscount" placeholder="0" oninput="Recovery._onDiscountInput('${customerId}')"></div>
         <div class="field"><label>Payment Method</label>
           <select id="f_recmethod">
             <option value="Cash">Cash</option>
@@ -4699,7 +4752,25 @@ const Recovery = {
     const month = $('#f_rectargetmonth').value;
     const remaining = month==='ADVANCE' ? 0 : Math.max(0, custMonthDueAmount(c, month) - custMonthPaidAmount(c, month));
     const amtField = $('#f_recamt');
-    if(amtField) amtField.value = remaining || (c.monthlyRate||0);
+    const disc = month==='ADVANCE' ? 0 : (Number($('#f_recdiscount') && $('#f_recdiscount').value)||0);
+    if(amtField){ amtField.value = Math.max(0, Math.round(((remaining || (c.monthlyRate||0)) - disc)*100)/100); delete amtField.dataset.touched; }
+    Recovery.updatePaymentPreview(customerId);
+  },
+  // BUGFIX (discount inflating Recovery): "Amount Received" is pre-filled
+  // with the FULL due, so typing a discount on top made amount+discount
+  // exceed the due and _commit() booked the excess as an advance credit AND
+  // as extra Recovery income. When the amount is still the untouched
+  // pre-filled suggestion, reduce it by the discount automatically so cash
+  // received = due - discount. A manually typed amount is never overridden.
+  _onDiscountInput(customerId){
+    const c = State.data.customers.find(x=>x.id===customerId);
+    const amtField = $('#f_recamt');
+    const month = $('#f_rectargetmonth') ? $('#f_rectargetmonth').value : 'ADVANCE';
+    if(c && amtField && !amtField.dataset.touched && amtField.value!=='' && month!=='ADVANCE'){
+      const remaining = Math.max(0, custMonthDueAmount(c, month) - custMonthPaidAmount(c, month));
+      const disc = Number($('#f_recdiscount').value)||0;
+      amtField.value = Math.max(0, Math.round((remaining - disc)*100)/100);
+    }
     Recovery.updatePaymentPreview(customerId);
   },
   // Pure single-month allocation calculator shared by the live preview and
@@ -4733,6 +4804,11 @@ const Recovery = {
       </div>`).join('') + (discount>0?`<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;color:var(--amber);"><span>Discount applied</span><b>−${fmtMoney(discount)}</b></div>`:'')
       : '<div class="small-muted">Enter an amount</div>';
     const c = State.data.customers.find(x=>x.id===customerId);
+    if(c && discount>0 && targetMonth!=='ADVANCE'){
+      const mRem = Math.max(0, custMonthDueAmount(c, targetMonth) - custMonthPaidAmount(c, targetMonth));
+      const extra = Math.round((amt + discount - mRem)*100)/100;
+      if(extra > 0.01) fp.innerHTML += `<div style="font-size:12px;padding:5px 0;color:var(--red);">⚠️ Amount + discount is ${fmtMoney(extra)} more than what is due. That extra will be saved as advance credit and counted as Recovery income — lower the Amount Received if the discount replaces it.</div>`;
+    }
     const rem = $('#fifoRemaining');
     if(c && rem){
       const due = targetMonth==='ADVANCE' ? 0 : custMonthDueAmount(c, targetMonth);
@@ -4828,12 +4904,24 @@ const Recovery = {
     if(amount<=0){ toast('Enter a valid amount','err'); return; }
     const date = $('#ep_date').value || pay.date;
     const collector = $('#ep_collector').value.trim();
+    const legacyIdx = pay.groupId ? -1 : Recovery._findLegacyLedgerIdx(pay); // look up BEFORE amount/date change
     pay.amount = Math.round(amount*100)/100; pay.date = date; pay.collector = collector;
+    if(legacyIdx>-1){ const le = State.data.profitLedger[legacyIdx]; le.amount = pay.amount; le.date = date; }
     if(pay.groupId){
       const ledgerEntry = State.data.profitLedger.find(x=>x.groupId===pay.groupId && x.type==='income');
       if(ledgerEntry){ ledgerEntry.amount = pay.amount; ledgerEntry.date = date; }
     }
     persist(); closeModal(); toast('Payment updated','ok'); renderPage();
+  },
+  // BUGFIX (Net Cash vs Recovery tab out of step): payments created by New
+  // Connection carry no groupId, and their ledger note names the customer
+  // instead of "customer <id>", so Undo/Edit never found their Recovery
+  // income line — the payment vanished from the Recovery tab but stayed in
+  // Net Cash's Total Recoveries (and edits changed only one side).
+  _findLegacyLedgerIdx(pay){
+    const c = State.data.customers.find(x=>x.id===pay.customerId);
+    const ncNote = c ? 'New connection — current month recovery — '+c.name : null;
+    return State.data.profitLedger.findIndex(x=>x.type==='income' && x.category==='Recovery' && x.date===pay.date && Math.abs(Number(x.amount)-Number(pay.amount))<0.01 && (((x.note||'').includes('customer '+pay.customerId)) || (ncNote && x.note===ncNote)));
   },
   undoPayment(paymentId){
     const pay = State.data.recoveryPayments.find(p=>p.id===paymentId);
@@ -4854,7 +4942,7 @@ const Recovery = {
       // ledger line from that old payment (if any) can't be traced back
       // reliably and is left for manual review.
       State.data.recoveryPayments = State.data.recoveryPayments.filter(p=>p.id!==paymentId);
-      const plIdx = State.data.profitLedger.findIndex(x=>x.type==='income' && x.category==='Recovery' && x.date===pay.date && Math.abs(Number(x.amount)-Number(pay.amount))<0.01 && (x.note||'').includes('customer '+pay.customerId));
+      const plIdx = Recovery._findLegacyLedgerIdx(pay);
       if(plIdx>-1) State.data.profitLedger.splice(plIdx,1);
     }
     persist();
@@ -4869,6 +4957,12 @@ const Recovery = {
     const date = $('#f_recdate').value;
     const collector = $('#f_reccollector').value.trim();
     const targetMonth = $('#f_rectargetmonth') ? $('#f_rectargetmonth').value : undefined;
+    if(discount>0 && targetMonth && targetMonth!=='ADVANCE'){
+      const cc = State.data.customers.find(x=>x.id===customerId);
+      const mRem = cc ? Math.max(0, custMonthDueAmount(cc, targetMonth) - custMonthPaidAmount(cc, targetMonth)) : 0;
+      const extra = Math.round((amt + discount - mRem)*100)/100;
+      if(extra > 0.01 && !confirm('Amount + discount is '+fmtMoney(extra)+' more than what is due for this month.\n\nThe extra '+fmtMoney(extra)+' will be saved as advance credit and added to Recovery income.\n\nPress Cancel to go back and lower the Amount Received.')) return;
+    }
     const allocations = Recovery._commit(customerId, {amount:amt, discount, method, date, collector, targetMonth});
     // Requirement 10 — no intrusive receipt pop-up and no automatic
     // WhatsApp send here: the payment is deducted immediately and a
@@ -4972,6 +5066,7 @@ const Recovery = {
       <div class="card stat-card accent-red"><div class="lbl">${allMonths?'Grand Total Pending — All Months':'Total Pending — '+monthLabel(month+'-01')}</div><div class="val">${fmtMoney(Math.max(0,expected-collected))}</div></div>
     `;
 
+    const cashNoteEl2 = $('#recCashNote'); if(cashNoteEl2) cashNoteEl2.innerHTML = recCashNoteHtml(month);
     const due = allMonths ? custPendingBalance(c) : custMonthDueAmount(c, month);
     const paid = allMonths ? custTotalPaid(c) : custMonthPaidAmount(c, month);
     const status = due===0
@@ -5067,7 +5162,7 @@ const Recovery = {
     if(!c) return;
     const days = Number(prompt('Grace period — how many days?','7'))||7;
     const until = new Date(); until.setDate(until.getDate()+days);
-    c.graceUntil = until.toISOString().slice(0,10);
+    c.graceUntil = localISO(until);
     MikroTik2.logConsole('Grace Period', c.name+' — extended '+days+' days, until '+c.graceUntil);
     persist(); toast('Grace period extended to '+fmtDate(c.graceUntil),'ok'); renderPage();
   },
@@ -6105,7 +6200,7 @@ function isCurrentMonth(dateStr){
   const d = new Date(dateStr), now = new Date();
   return d.getFullYear()===now.getFullYear() && d.getMonth()===now.getMonth();
 }
-const BIZ_EXPENSE_CATEGORIES = ['Tower Rent','Monthly Data Bill','Petrol','Refreshment','Others'];
+const BIZ_EXPENSE_CATEGORIES = ['Tower Rent','Monthly Data Bill','Steel Wire','Refreshment','Others'];
 // Tower Rent and Monthly Data Bill are fixed monthly costs — never
 // editable, always exactly Rs. 5,000 / Rs. 15,000 respectively regardless
 // of what's typed into the Amount field. Every other category keeps a
@@ -8250,7 +8345,7 @@ window.addEventListener('online', ()=>{
   if(FIREBASE_READY && db && State.currentUser){
     $('#syncDot') && $('#syncDot').classList.remove('off');
     $('#syncText') && ($('#syncText').textContent = 'Reconnected — syncing…');
-    db.collection('businesses').doc(BUSINESS_ID).set(State.data, {merge:false})
+    db.collection('businesses').doc(BUSINESS_ID).set(cloudSafe(), {merge:false})
       .then(()=>{ $('#syncText') && ($('#syncText').textContent='Synced'); })
       .catch(err=>{ console.error(err); });
   }
