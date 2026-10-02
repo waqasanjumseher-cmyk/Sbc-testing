@@ -1435,6 +1435,12 @@ function loadLocal(){
 // function so it can be re-applied after *every* place State.data gets
 // bulk-replaced from an external source, not just once at boot.
 function repairData(){
+  // The 'Steel Wire' expense category was renamed to 'Petrol'. Move any
+  // existing entries across so they stay in the expense list and totals
+  // (entries under a category missing from BIZ_EXPENSE_CATEGORIES are skipped).
+  if(Array.isArray(State.data.profitLedger)){
+    State.data.profitLedger.forEach(x=>{ if(x && x.type==='expense' && x.category==='Steel Wire') x.category = 'Petrol'; });
+  }
   if(!State.data.permissions || !State.data.permissions.Admin || Object.keys(State.data.permissions.Admin).length===0){
     State.data.permissions = defaultPerms();
   }
@@ -2370,9 +2376,22 @@ function computeOperatingCashflow(range){
   // Commercial Cumulative section. Including them here too would double
   // -count the same cash under both "Total Recoveries" (this card) and
   // "Pending Dues Received" (the other split-section) at once.
-  const totalRecoveries = d.profitLedger
-    .filter(x=>x.type==='income' && x.category==='Recovery' && inMonth(x.date) && recoveryAppliedMonth(x)!=='0000-00')
-    .reduce((s,x)=>s+Number(x.amount||0),0);
+  // BUGFIX (Net Cash showed more recovery than was really collected): this
+  // used to add up EVERY 'Recovery' line in profitLedger for the month —
+  // including advance/overpayment lines (the discount bug created these),
+  // old-month dues, and any stray/manual 'Recovery' line with no payment
+  // record behind it. For the monthly card it now sums the real payment
+  // records' cash (amount minus discount) for that month's bills — the very
+  // same figure the Recovery tab shows as "Collected". Old-month dues stay
+  // reported under "Pending Dues Received" in the All-Time column. A custom
+  // {from,to} report range keeps the original ledger-by-date method.
+  const totalRecoveries = (range && range.from && range.to)
+    ? d.profitLedger
+        .filter(x=>x.type==='income' && x.category==='Recovery' && inMonth(x.date) && recoveryAppliedMonth(x)!=='0000-00')
+        .reduce((s,x)=>s+Number(x.amount||0),0)
+    : d.recoveryPayments
+        .filter(p=>p.month===mk)
+        .reduce((s,p)=>s+paymentCashAmount(p),0);
   const totalBizExpenses = d.profitLedger
     .filter(x=>x.type==='expense' && BIZ_EXPENSE_CATEGORIES.includes(x.category) && inMonth(x.date))
     .reduce((s,x)=>s+Number(x.amount||0),0);
@@ -3514,6 +3533,12 @@ const Inventory = {
 // be thrown off by it. Requirement 5 — the Sale button was removed from
 // Inventory's cards; selling now starts here instead via "+ Add New Sale"
 // (Inventory.openSellPicker → the same unchanged Sell form/logic).
+// Item-column text for a Sales row; Pending Collection rows also show their
+// remark underneath.
+function salesItemCell(e){
+  const base = esc(e.itemName || (e.note||'').replace(/^Sold\s*/,''));
+  return (e.status==='Pending Collection' && e.remark) ? base+'<div class="small-muted">'+esc(e.remark)+'</div>' : base;
+}
 Pages.sales = function(){
   const d = State.data;
   const entries = d.profitLedger.filter(x=>x.category==='Inventory Sale').slice().sort((a,b)=>new Date(b.date)-new Date(a.date));
@@ -3525,6 +3550,7 @@ Pages.sales = function(){
   $('#pageContent').innerHTML = `
     <div class="search-bar">
       <button class="btn green" onclick="Inventory.openSellPicker()">+ Add New Sale</button>
+      <button class="btn" style="background:#f59e0b;" onclick="Sales.openPendingCollection()">💵 Pending Collection</button>
       ${reportBlock('sales', 'Generate Report — Custom Date Range', 'salesReportBody',
         reportRangeControls('salesRepFrom','salesRepTo', rFrom, rTo, 'SalesReport.render()', 'Sales Report'),
         ()=>SalesReport.render())}
@@ -3541,7 +3567,7 @@ Pages.sales = function(){
           ${entries.map(e=>`
             <tr>
               <td>${fmtDate(e.date)}</td>
-              <td>${esc(e.itemName || (e.note||'').replace(/^Sold\\s*/,''))}</td>
+              <td>${salesItemCell(e)}</td>
               <td>${esc(e.buyerName||'-')}</td>
               <td>${esc(e.status||'-')}</td>
               <td>${fmtMoney(e.amount)}</td>
@@ -3554,6 +3580,57 @@ Pages.sales = function(){
   `;
 };
 const Sales = {
+  // Pending Collection: money already collected from customers' older/pending
+  // dues that was never recorded in the app. It is posted as a normal 'Inventory
+  // Sale' income line (no item, no stock change), so every existing Sales
+  // figure — Sales tab totals, Sales report, Net Cash "Sales" — counts it as a
+  // sale automatically, with no change to any calculation.
+  openPendingCollection(id){
+    const e = id ? State.data.profitLedger.find(x=>x.id===id && x.category==='Inventory Sale') : null;
+    if(id && !e){ toast('Entry not found','err'); return; }
+    openModal(`
+      <div class="modal-header"><h3>${e?'Edit':'Add'} Pending Collection</h3><button class="modal-close" onclick="closeModal()">×</button></div>
+      <div class="small-muted" style="margin-bottom:8px;">Amount collected from previous pending dues. It is counted as a sale; no stock is changed.</div>
+      <div class="form-grid">
+        <div class="field"><label>Amount</label><input type="number" id="f_pcamt" placeholder="0" value="${e?Number(e.amount)||'':''}"></div>
+        <div class="field"><label>Date</label><input type="date" id="f_pcdate" value="${e?esc(e.date||todayISO()):todayISO()}"></div>
+        <div class="field field-full"><label>Customer / Name (optional)</label><input id="f_pcname" value="${e?esc(e.buyerName||''):''}" placeholder="Who paid"></div>
+        <div class="field field-full"><label>Remark (optional)</label><input id="f_pcremark" value="${e?esc(e.remark||''):''}" placeholder="e.g. Aug–Sep pending dues"></div>
+      </div>
+      <div class="modal-actions" style="justify-content:space-between;">
+        ${e?`<button class="btn red" onclick="Sales.deletePendingCollection('${e.id}')">Delete</button>`:'<span></span>'}
+        <div style="display:flex;gap:8px;">
+          <button class="btn gray" onclick="closeModal()">Cancel</button>
+          <button class="btn green" onclick="Sales.savePendingCollection(${e?`'${e.id}'`:''})">✅ Save</button>
+        </div>
+      </div>
+    `);
+  },
+  savePendingCollection(id){
+    const amount = Math.round((Number($('#f_pcamt').value)||0)*100)/100;
+    if(amount<=0){ toast('Enter a valid amount','err'); return; }
+    const date = $('#f_pcdate').value || todayISO();
+    const buyerName = $('#f_pcname').value.trim();
+    const remark = $('#f_pcremark').value.trim();
+    const fields = {
+      date, type:'income', category:'Inventory Sale', amount,
+      itemName:'Pending Collection', buyerName, remark, qty:1, unitPrice:amount, status:'Pending Collection',
+      note:'Pending collection'+(buyerName?' — '+buyerName:'')+(remark?' ('+remark+')':'')
+    };
+    if(id){
+      const e = State.data.profitLedger.find(x=>x.id===id);
+      if(!e){ toast('Entry not found','err'); return; }
+      Object.assign(e, fields);
+    }else{
+      State.data.profitLedger.push(Object.assign({id:uid('pl')}, fields));
+    }
+    persist(); closeModal(); toast('Pending collection saved as sale','ok'); renderPage();
+  },
+  deletePendingCollection(id){
+    if(!confirm('Delete this pending collection entry?')) return;
+    State.data.profitLedger = State.data.profitLedger.filter(x=>x.id!==id);
+    persist(); closeModal(); toast('Deleted','ok'); renderPage();
+  },
   // Requirement — Edit Sale form: Buyer Name, Date (date picker), Selling
   // Price, Status (New Connection / Exchanged). Quantity/Item aren't
   // editable here (not part of the requested fields) — Amount is simply
@@ -3561,6 +3638,7 @@ const Sales = {
   editSale(id){
     const e = State.data.profitLedger.find(x=>x.id===id && x.category==='Inventory Sale');
     if(!e){ toast('Sale not found','err'); return; }
+    if(e.status==='Pending Collection'){ Sales.openPendingCollection(id); return; }
     // Older sales (recorded before Buyer Name/Status/Qty existed as their
     // own fields, or posted automatically by New Connection/Trade-In)
     // won't have qty/unitPrice stored — fall back to sane defaults so the
@@ -3627,7 +3705,7 @@ const SalesReport = {
       <div class="table-wrap"><table>
         <thead><tr><th>Date</th><th>Item</th><th>Buyer</th><th>Status</th><th>Amount</th><th></th></tr></thead>
         <tbody>
-          ${rows.map(x=>`<tr><td>${fmtDate(x.date)}</td><td>${esc(x.itemName || (x.note||'').replace(/^Sold\\s*/,''))}</td><td>${esc(x.buyerName||'-')}</td><td>${esc(x.status||'-')}</td><td>${fmtMoney(x.amount)}</td><td><button class="btn sm gray" onclick="Sales.editSale('${x.id}')">Edit</button></td></tr>`).join('') || '<tr><td colspan="6" class="small-muted">No sales in this period</td></tr>'}
+          ${rows.map(x=>`<tr><td>${fmtDate(x.date)}</td><td>${salesItemCell(x)}</td><td>${esc(x.buyerName||'-')}</td><td>${esc(x.status||'-')}</td><td>${fmtMoney(x.amount)}</td><td><button class="btn sm gray" onclick="Sales.editSale('${x.id}')">Edit</button></td></tr>`).join('') || '<tr><td colspan="6" class="small-muted">No sales in this period</td></tr>'}
         </tbody>
       </table></div>
     `;
@@ -4517,7 +4595,6 @@ Pages.recovery = function(){
     </div>
     <div class="card" style="margin-top:10px;">
       <div class="section-title" id="recTableTitle">💰 Recovery &amp; Dues</div>
-      <div id="recCashNote"></div>
       <div id="billingBody" class="item-card-list"></div>
     </div>
   `;
@@ -4560,7 +4637,6 @@ Pages.recovery = function(){
       <div class="card stat-card accent-red"><div class="lbl">${allMonths?'Grand Total Pending — All Months':'Total Pending — '+monthLabel(month+'-01')}</div><div class="val">${fmtMoney(Math.max(0,expected-collected))}</div></div>
     `;
 
-    const cashNoteEl = $('#recCashNote'); if(cashNoteEl) cashNoteEl.innerHTML = recCashNoteHtml(month);
     const rows = d.customers.filter(c=>
       !q || (c.name||'').toLowerCase().includes(q) || (c.phone||'').includes(q) || c.id.includes(q)
     ).map(c=>{
@@ -4609,32 +4685,6 @@ Pages.recovery = function(){
 // the Pending Dues sidebar/dashboard entry stays (so nothing referencing
 // goPage('pending') breaks) but renders the exact same merged view.
 Pages.pending = Pages.recovery;
-// Explains (display only, no totals changed) why the Recovery tab's
-// "Collected" and the dashboard's Net Cash "Total Recoveries" can differ:
-// Collected = payments made FOR that month's bills (any date); Net Cash =
-// cash actually RECEIVED in that month (any bill). This reuses Net Cash's
-// own filter and splits it so the two figures can be reconciled on screen.
-function recCashNoteHtml(month){
-  if(!month || month==='ALL') return '';
-  let total=0, own=0, older=0, adv=0, early=0;
-  State.data.profitLedger.forEach(x=>{
-    if(x.type!=='income' || x.category!=='Recovery') return;
-    const am = recoveryAppliedMonth(x);
-    if(am==='0000-00') return;
-    const a = Number(x.amount||0);
-    const isAdv = /^Advance\/overpayment/.test(x.note||'');
-    if(monthKey(x.date)===month){
-      total += a;
-      if(isAdv) adv += a; else if(am===month) own += a; else older += a;
-    }else if(!isAdv && am===month){ early += a; }
-  });
-  const f = fmtMoney;
-  return `<div style="font-size:11px;line-height:1.6;padding:6px 2px 10px;color:var(--text-mid);">
-    💵 <b>Cash received in ${monthLabel(month+'-01')}: ${f(total)}</b> (this is what Net Cash shows)<br>
-    &nbsp;&nbsp;• for ${monthLabel(month+'-01')} bills: ${f(own)} &nbsp;• older months' dues: ${f(older)} &nbsp;• advance / extra: ${f(adv)}<br>
-    ${early>0.01 ? `&nbsp;&nbsp;• plus ${f(early)} paid in another month for ${monthLabel(month+'-01')} bills (counted in Collected only)<br>` : ''}
-    <span class="small-muted">"Collected" above counts only payments made for ${monthLabel(month+'-01')} bills.</span></div>`;
-}
 const Recovery = {
   // New Collection Form, general entry point (not tied to a row): pick any
   // customer from a dropdown, and their outstanding balance / package
@@ -5066,7 +5116,6 @@ const Recovery = {
       <div class="card stat-card accent-red"><div class="lbl">${allMonths?'Grand Total Pending — All Months':'Total Pending — '+monthLabel(month+'-01')}</div><div class="val">${fmtMoney(Math.max(0,expected-collected))}</div></div>
     `;
 
-    const cashNoteEl2 = $('#recCashNote'); if(cashNoteEl2) cashNoteEl2.innerHTML = recCashNoteHtml(month);
     const due = allMonths ? custPendingBalance(c) : custMonthDueAmount(c, month);
     const paid = allMonths ? custTotalPaid(c) : custMonthPaidAmount(c, month);
     const status = due===0
@@ -6200,7 +6249,7 @@ function isCurrentMonth(dateStr){
   const d = new Date(dateStr), now = new Date();
   return d.getFullYear()===now.getFullYear() && d.getMonth()===now.getMonth();
 }
-const BIZ_EXPENSE_CATEGORIES = ['Tower Rent','Monthly Data Bill','Steel Wire','Refreshment','Others'];
+const BIZ_EXPENSE_CATEGORIES = ['Tower Rent','Monthly Data Bill','Petrol','Refreshment','Others'];
 // Tower Rent and Monthly Data Bill are fixed monthly costs — never
 // editable, always exactly Rs. 5,000 / Rs. 15,000 respectively regardless
 // of what's typed into the Amount field. Every other category keeps a
@@ -6961,7 +7010,7 @@ const Reports = {
       <div class="table-wrap"><table>
         <thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Description</th></tr></thead>
         <tbody>
-          ${rows.map(x=>`<tr><td>${fmtDate(x.date)}</td><td>${isConnBundle(x)?'🔌 New Connection':'📦 Direct Sale'}</td><td>${fmtMoney(x.amount)}</td><td>${esc(x.note||'')}</td></tr>`).join('') || '<tr><td colspan="4" class="small-muted">No device/equipment sales in this period</td></tr>'}
+          ${rows.map(x=>`<tr><td>${fmtDate(x.date)}</td><td>${x.status==='Pending Collection'?'💵 Pending Collection':(isConnBundle(x)?'🔌 New Connection':'📦 Direct Sale')}</td><td>${fmtMoney(x.amount)}</td><td>${esc(x.note||'')}</td></tr>`).join('') || '<tr><td colspan="4" class="small-muted">No device/equipment sales in this period</td></tr>'}
         </tbody>
       </table></div>
     `;
