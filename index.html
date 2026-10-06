@@ -2841,7 +2841,7 @@ Pages.customers = function(){
         ${c.package!==false ? `<td>${esc(x.package||'-')}</td>` : ''}
         ${c.rate!==false ? `<td>${fmtMoney(x.monthlyRate)}</td>` : ''}
         ${c.balance!==false ? `<td style="color:${custPendingBalance(x)>0?'var(--red)':'var(--green)'};font-weight:600;">${fmtMoney(custPendingBalance(x))}</td>` : ''}
-        ${c.status!==false ? `<td><span class="badge ${(x.status||'Active').toLowerCase()}">${x.status||'Active'}</span></td>` : ''}
+        ${c.status!==false ? `<td><span class="badge ${(x.status||'Active').toLowerCase()}" ${x.status==='Suspended' ? '' : `onclick="Customers.toggleStatus('${x.id}')" title="Tap to switch Active / Expired" style="cursor:pointer;padding:5px 11px;"`}>${x.status||'Active'}</span></td>` : ''}
         <td><button class="btn sm gray" onclick="Customers.openForm('${x.id}')">Edit</button>
         </td>
       </tr>
@@ -2975,6 +2975,20 @@ const Customers = {
       State.data.customers.push(rec);
     }
     persist(); closeModal(); toast('Saved','ok'); renderPage();
+  },
+  // One-tap status switch from the Users list: Active -> Expired and
+  // Expired -> Active. Same effect as changing Status in the Edit form (the
+  // status label only; no billing or ledger change). Suspended users are left
+  // alone here because suspension pauses billing and is handled through Edit.
+  toggleStatus(id){
+    const c = State.data.customers.find(x=>x.id===id);
+    if(!c) return;
+    const cur = c.status || 'Active';
+    if(cur==='Suspended'){ toast('Suspended users are changed from Edit','err'); return; }
+    c.status = (cur==='Active') ? 'Expired' : 'Active';
+    persist();
+    toast(c.name+' is now '+c.status+' — tap again to switch back','ok');
+    if(Pages._custRenderRows) Pages._custRenderRows(); else renderPage();
   },
   // PATCH 1 — Connection Reclaim Logic: don't silently delete allocated
   // hardware. If this customer has any materials on record, ask whether
