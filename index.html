@@ -1435,6 +1435,7 @@ function loadLocal(){
 // function so it can be re-applied after *every* place State.data gets
 // bulk-replaced from an external source, not just once at boot.
 function repairData(){
+  reconcileExpiry();
   // The 'Steel Wire' expense category was renamed to 'Petrol'. Move any
   // existing entries across so they stay in the expense list and totals
   // (entries under a category missing from BIZ_EXPENSE_CATEGORIES are skipped).
@@ -1547,6 +1548,7 @@ function saveLocal(){
 
 let _saveTimer = null;
 function persist(){
+  reconcileExpiry();
   saveLocal();
   renderSidebar(); // reflect settings/perm changes quickly
   if(FIREBASE_READY && db){
@@ -2637,12 +2639,50 @@ function custIsMonthSuspended(c, mKey){
   }
   return false;
 }
+// EXPIRED users are not billed. c.expiredSince is set while status==='Expired';
+// closed windows go to c.expiredHistory [{from,to}] when the user is made
+// Active again (kept in sync by reconcileExpiry(), which runs on every save).
+// Unlike a suspension, the month the expiry happens in is already free (the
+// bill is not going to be paid), and the month of reactivation is billed.
+// Months BEFORE the expiry month stay owed exactly as they were. A month that
+// already has a payment recorded is left billed so paid never exceeds due.
+function custIsMonthExpired(c, mKey){
+  const periods = (c.expiredHistory||[]).slice();
+  if(c.status==='Expired' && c.expiredSince) periods.push({from:c.expiredSince, to:null});
+  for(const p of periods){
+    if(!p.from) continue;
+    if(mKey < monthKey(p.from)) continue;
+    if(p.to == null) return true;
+    if(mKey <= _monthBefore(monthKey(p.to))) return true;
+  }
+  return false;
+}
+// Label for a month with nothing to bill because of suspension/expiry (or null).
+function custMonthFreeLabel(c, mKey){
+  if(custIsMonthSuspended(c, mKey)) return 'Suspended';
+  if(custIsMonthExpired(c, mKey) && custMonthPaidAmount(c, mKey)<=0.01) return 'Expired';
+  return null;
+}
+// Keeps expiredSince / expiredHistory in step with status, whichever screen
+// changed the status (Edit form, Users-list tap, import, MikroTik actions).
+function reconcileExpiry(){
+  const t = todayISO();
+  (State.data.customers||[]).forEach(c=>{
+    if(c.status==='Expired'){
+      if(!c.expiredSince) c.expiredSince = t;
+    } else if(c.expiredSince){
+      if(c.expiredSince !== t){ (c.expiredHistory = c.expiredHistory||[]).push({from:c.expiredSince, to:t}); }
+      c.expiredSince = null;
+    }
+  });
+}
 // Amount owed for one specific calendar month for this customer — the first
 // month uses the stored pro-rata amount when available, all other months
 // use the full monthly rate. Months fully covered by a suspension are free.
 function custMonthDueAmount(c, mKey){
   if(mKey === 'OPENING') return Number(c.openingBalance||0);
   if(custIsMonthSuspended(c, mKey)) return 0;
+  if(custIsMonthExpired(c, mKey) && custMonthPaidAmount(c, mKey) <= 0.01) return 0;
   const firstMonthKey = c.connectionDate ? monthKey(c.connectionDate) : null;
   // BUGFIX: a month BEFORE the customer was connected is never billed. This
   // used to return the full monthly rate for any month key, so a customer
@@ -2750,7 +2790,7 @@ function custMonthWiseBreakdown(c){
     // A customer with monthlyRate 0 (comp/free account) has due===0 for a
     // reason unrelated to suspension — treat that as settled/"Paid" by
     // default instead of misleadingly flagging it "Unpaid" forever.
-    const status = due===0 ? (custIsMonthSuspended(c, mk) ? 'Suspended' : 'Paid') : (paid<=0.01 ? 'Unpaid' : (paid < due-0.01 ? 'Partial' : 'Paid'));
+    const status = due===0 ? (custMonthFreeLabel(c, mk) || 'Paid') : (paid<=0.01 ? 'Unpaid' : (paid < due-0.01 ? 'Partial' : 'Paid'));
     out.push({month:mk, due, paid, remaining, status});
     d.setDate(1); d.setMonth(d.getMonth()+1); // setDate(1) first: avoids 31st->next-next-month overflow
   }
@@ -2950,7 +2990,9 @@ const Customers = {
       // Carry these over by default; the status-transition block below
       // overrides them when the Status dropdown itself is what changed.
       suspendedSince: id ? (existing.suspendedSince ?? null) : null,
-      suspensionHistory: id ? (existing.suspensionHistory ? existing.suspensionHistory.slice() : []) : []
+      suspensionHistory: id ? (existing.suspensionHistory ? existing.suspensionHistory.slice() : []) : [],
+      expiredSince: id ? (existing.expiredSince ?? null) : null,
+      expiredHistory: id ? (existing.expiredHistory ? existing.expiredHistory.slice() : []) : []
     };
     // Keep suspension tracking consistent even when staff change Status
     // from this plain dropdown instead of using Simulate Disconnect /
@@ -3180,7 +3222,7 @@ const Customers = {
                 <td>${fmtMoney(b.due)}</td>
                 <td>${fmtMoney(b.paid)}</td>
                 <td><span class="badge ${badgeClass}">${b.status}</span></td>
-                <td>${(b.status!=='Paid' && b.status!=='Suspended') ? `<button class="btn sm green" onclick="Recovery.openPaymentForMonth('${c.id}','${b.month}')">Pay</button>` : ''}</td>
+                <td>${(b.status!=='Paid' && b.status!=='Suspended' && b.status!=='Expired') ? `<button class="btn sm green" onclick="Recovery.openPaymentForMonth('${c.id}','${b.month}')">Pay</button>` : ''}</td>
               </tr>`;
             }).join('') || '<tr><td colspan="5" class="small-muted">No billing history yet</td></tr>'}
           </tbody>
@@ -4670,12 +4712,12 @@ Pages.recovery = function(){
       // balance in "All Months" view) legitimately being 0 should read as
       // settled, not "Unpaid".
       const status = due===0
-        ? ((!allMonths && custIsMonthSuspended(c, month)) ? 'Suspended' : 'Paid')
+        ? ((!allMonths && custMonthFreeLabel(c, month)) || 'Paid')
         : (paid <= 0 ? 'Unpaid' : (paid < due-0.01 ? 'Partial' : 'Paid'));
       return {c, due, paid, status};
     }).filter(x=>{
       if(stFilter==='Paid') return x.status==='Paid';
-      if(stFilter==='Unpaid') return x.status!=='Paid' && x.status!=='Suspended';
+      if(stFilter==='Unpaid') return x.status!=='Paid' && x.status!=='Suspended' && x.status!=='Expired';
       return true;
     });
 
@@ -5161,11 +5203,11 @@ const Recovery = {
     const due = allMonths ? custPendingBalance(c) : custMonthDueAmount(c, month);
     const paid = allMonths ? custTotalPaid(c) : custMonthPaidAmount(c, month);
     const status = due===0
-      ? ((!allMonths && custIsMonthSuspended(c, month)) ? 'Suspended' : 'Paid')
+      ? ((!allMonths && custMonthFreeLabel(c, month)) || 'Paid')
       : (paid <= 0 ? 'Unpaid' : (paid < due-0.01 ? 'Partial' : 'Paid'));
 
     const stillMatchesSearch = !q || (c.name||'').toLowerCase().includes(q) || (c.phone||'').includes(q) || c.id.includes(q);
-    const stillMatchesFilter = stFilter==='Paid' ? status==='Paid' : (stFilter==='Unpaid' ? (status!=='Paid' && status!=='Suspended') : true);
+    const stillMatchesFilter = stFilter==='Paid' ? status==='Paid' : (stFilter==='Unpaid' ? (status!=='Paid' && status!=='Suspended' && status!=='Expired') : true);
 
     if(!stillMatchesSearch || !stillMatchesFilter){
       // No longer belongs in this filtered view (e.g. they were a
