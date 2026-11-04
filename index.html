@@ -2776,6 +2776,33 @@ function custEffectiveCredit(c){
     return s + a;
   },0);
 }
+// Small detail line for a Recovery row, so lists and printed reports show how
+// much was COLLECTED from each user, not only what is still pending.
+// Collected = cash actually received (discounts are not cash).
+function recRowDetailHtml(c, month, allMonths, due){
+  const pays = State.data.recoveryPayments.filter(p=>p.customerId===c.id && (allMonths || p.month===month));
+  const cash = allMonths ? custTotalCashRecovered(c) : pays.reduce((s,p)=>s+paymentCashAmount(p),0);
+  const disc = pays.reduce((s,p)=>s+Number(p.discount||0),0);
+  const lateCash = allMonths ? 0 : monthCollectedSplit(month, c.id).later;
+  return `<div class="small-muted" style="font-size:11px;font-weight:500;">Bill ${fmtMoney(due)}${disc>0.01?' · Discount '+fmtMoney(disc):''} · <span style="color:var(--green);">Collected ${fmtMoney(cash)}</span>${(!allMonths && lateCash>0.01) ? ' <span style="color:var(--amber);">(later '+fmtMoney(lateCash)+')</span>' : ''}</div>`;
+}
+// Splits the cash collected for one month's bills into:
+//   within = paid on or before the last day of that month,
+//   later  = paid after the month ended (late payments).
+// within + later is exactly the month's Collected figure.
+function monthCollectedSplit(month, customerId){
+  let within = 0, later = 0;
+  State.data.recoveryPayments.forEach(p=>{
+    if(p.month!==month || (customerId && p.customerId!==customerId)) return;
+    const cash = paymentCashAmount(p);
+    if(monthKey(p.date) > month) later += cash; else within += cash;
+  });
+  return {within:Math.round(within*100)/100, later:Math.round(later*100)/100};
+}
+function collectedSplitHtml(month){
+  const sp = monthCollectedSplit(month);
+  return `<div class="small-muted" style="font-size:11px;margin-top:2px;line-height:1.5;">Within ${monthLabel(month+'-01').split(' ')[0]}: <b>${fmtMoney(sp.within)}</b><br>Later: <b>${fmtMoney(sp.later)}</b></div>`;
+}
 function custTotalCashRecovered(c){
   return State.data.recoveryPayments.filter(p=>p.customerId===c.id).reduce((s,p)=>s+paymentCashAmount(p),0)
        + custEffectiveCredit(c);
@@ -4777,7 +4804,7 @@ Pages.recovery = function(){
     }
     $('#recStats').innerHTML = `
       <div class="card stat-card"><div class="lbl">${allMonths?'Total Billed — All Time':'Expected'}</div><div class="val">${fmtMoney(expected)}</div></div>
-      <div class="card stat-card accent-green"><div class="lbl">${allMonths?'Total Collected — All Time':'Collected'}</div><div class="val">${fmtMoney(collected)}</div></div>
+      <div class="card stat-card accent-green"><div class="lbl">${allMonths?'Total Collected — All Time':'Collected'}</div><div class="val">${fmtMoney(collected)}</div>${allMonths?'':collectedSplitHtml(month)}</div>
       <div class="card stat-card accent-red"><div class="lbl">${allMonths?'Grand Total Pending — All Months':'Total Pending — '+monthLabel(month+'-01')}</div><div class="val">${fmtMoney(Math.max(0,expected-collected))}</div></div>
     `;
 
@@ -4815,7 +4842,7 @@ Pages.recovery = function(){
              <button class="btn sm" style="background:#25D366;" onclick="Receipts.sendWhatsAppAlert('${c.id}')">💬 Reminder</button>`;
       return `<div class="rec-simple-row" id="rec-row-${c.id}">
         <div class="rec-sr">${idx+1}</div>
-        <div class="rec-name"><a href="javascript:void(0)" onclick="Customers.openProfile('${c.id}')">${esc(c.name)}</a>${suspTag}</div>
+        <div class="rec-name"><a href="javascript:void(0)" onclick="Customers.openProfile('${c.id}')">${esc(c.name)}</a>${suspTag}${recRowDetailHtml(c, month, allMonths, due)}</div>
         <div class="rec-amt" style="color:${pending>0?'var(--red)':'var(--green)'};">${fmtMoney(pending)}</div>
         <div class="rec-btns">${actionsHtml}</div>
       </div>`;
@@ -4881,7 +4908,7 @@ Pages.recoveryPending = function(){
       const since = oldest ? (oldest==='OPENING' ? 'opening balance' : 'since '+monthLabel(oldest+'-01')) : '';
       return `<div class="rec-simple-row" id="rec-row-${c.id}">
         <div class="rec-sr">${idx+1}</div>
-        <div class="rec-name"><a href="javascript:void(0)" onclick="Customers.openProfile('${c.id}')">${esc(c.name)}</a>${tag}<div class="small-muted" style="font-size:11px;">${months} unpaid month(s)${since?' · '+since:''}</div></div>
+        <div class="rec-name"><a href="javascript:void(0)" onclick="Customers.openProfile('${c.id}')">${esc(c.name)}</a>${tag}<div class="small-muted" style="font-size:11px;">${months} unpaid month(s)${since?' · '+since:''}</div>${recRowDetailHtml(c, null, true, custTotalBilled(c))}</div>
         <div class="rec-amt" style="color:var(--red);">${fmtMoney(pending)}</div>
         <div class="rec-btns">
           <button class="btn sm green" onclick="Recovery.markPaidRow('${c.id}')">✅ Paid</button>
@@ -5425,7 +5452,7 @@ const Recovery = {
     }
     recStats.innerHTML = `
       <div class="card stat-card"><div class="lbl">${allMonths?'Total Billed — All Time':'Expected'}</div><div class="val">${fmtMoney(expected)}</div></div>
-      <div class="card stat-card accent-green"><div class="lbl">${allMonths?'Total Collected — All Time':'Collected'}</div><div class="val">${fmtMoney(collected)}</div></div>
+      <div class="card stat-card accent-green"><div class="lbl">${allMonths?'Total Collected — All Time':'Collected'}</div><div class="val">${fmtMoney(collected)}</div>${allMonths?'':collectedSplitHtml(month)}</div>
       <div class="card stat-card accent-red"><div class="lbl">${allMonths?'Grand Total Pending — All Months':'Total Pending — '+monthLabel(month+'-01')}</div><div class="val">${fmtMoney(Math.max(0,expected-collected))}</div></div>
     `;
 
@@ -5464,7 +5491,7 @@ const Recovery = {
            <button class="btn sm" style="background:#25D366;" onclick="Receipts.sendWhatsAppAlert('${c.id}')">💬 Reminder</button>`;
     rowEl.outerHTML = `<div class="rec-simple-row" id="rec-row-${c.id}">
       <div class="rec-sr">${esc(existingSerial)}</div>
-      <div class="rec-name"><a href="javascript:void(0)" onclick="Customers.openProfile('${c.id}')">${esc(c.name)}</a>${suspTag}</div>
+      <div class="rec-name"><a href="javascript:void(0)" onclick="Customers.openProfile('${c.id}')">${esc(c.name)}</a>${suspTag}${recRowDetailHtml(c, month, allMonths, due)}</div>
       <div class="rec-amt" style="color:${pending>0?'var(--red)':'var(--green)'};">${fmtMoney(pending)}</div>
       <div class="rec-btns">${actionsHtml}</div>
     </div>`;
