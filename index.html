@@ -2182,10 +2182,41 @@ function renderSidebar(){
   if(mqnDevLabel) mqnDevLabel.textContent = (State.currentUser && State.currentUser.isDeveloper) ? 'Lock Dev' : 'Dev Access';
 }
 
+// ===== Phone / browser Back button support =====
+// Every page change and every opened user profile adds one history entry,
+// so the device's Back button returns to the page you came from (e.g. a
+// profile opened from Recovery goes back to Recovery) instead of leaving
+// the app. An open pop-up is closed first.
+function navPush(st){
+  if(window._navRestoring) return;
+  try{
+    const cur = history.state;
+    if(cur && cur.pg===st.pg && (cur.prof||null)===(st.prof||null)) return; // refresh of the same screen
+    if(!cur) history.replaceState(st,''); else history.pushState(st,'');
+  }catch(e){}
+}
+window.addEventListener('popstate', e=>{
+  if(!State.currentUser) return;
+  const modalOpen = document.querySelector('#modalBg') && document.querySelector('#modalBg').classList.contains('show');
+  if(modalOpen){
+    // Back closes the pop-up only; stay on the same screen.
+    closeModal();
+    try{ history.pushState({pg:State.activePage, prof:State._profileCustomerId||null},''); }catch(_){}
+    return;
+  }
+  const st = e.state;
+  if(!st || !st.pg) return;
+  window._navRestoring = true;
+  try{
+    goPage(st.pg);
+    if(st.prof && State.data.customers.some(c=>c.id===st.prof)) Customers.openProfile(st.prof);
+  } finally { window._navRestoring = false; }
+});
 function goPage(key){
   if(!hasPerm(key)){ toast('Access denied', 'err'); return; }
   State.activePage = key;
   State._profileCustomerId = null; // leaving a customer profile back to a module list
+  navPush({pg:key, prof:null});
   const mod = MODULES.find(m=>m.key===key);
   $('#pageTitle').textContent = mod.label;
   $('#pageSub').textContent = mod.sub;
@@ -2659,7 +2690,7 @@ function custIsMonthExpired(c, mKey){
 }
 // Label for a month with nothing to bill because of suspension/expiry (or null).
 function custMonthFreeLabel(c, mKey){
-  if(custIsMonthSuspended(c, mKey)) return 'Suspended';
+  if(custIsMonthSuspended(c, mKey)) return 'Expired'; // older suspension windows now read as Expired
   if(custIsMonthExpired(c, mKey) && custMonthPaidAmount(c, mKey)<=0.01) return 'Expired';
   return null;
 }
@@ -2667,6 +2698,21 @@ function custMonthFreeLabel(c, mKey){
 // changed the status (Edit form, Users-list tap, import, MikroTik actions).
 function reconcileExpiry(){
   const t = todayISO();
+  // 'Suspended' is no longer a user status: any such user becomes Expired.
+  // Their open suspension window moves over unchanged — months that fell
+  // entirely inside the suspension stay free, the month it started in stays
+  // billed (so the expiry starts on the 1st of the following month unless the
+  // suspension began on the 1st). Past closed windows are left as they were.
+  (State.data.customers||[]).forEach(c=>{
+    if(c.status==='Suspended'){
+      c.status = 'Expired';
+      if(c.suspendedSince && !c.expiredSince){
+        const d = new Date(c.suspendedSince+'T00:00:00');
+        c.expiredSince = isNaN(d) ? t : (d.getDate()===1 ? c.suspendedSince : localISO(new Date(d.getFullYear(), d.getMonth()+1, 1)));
+      }
+      c.suspendedSince = null;
+    }
+  });
   (State.data.customers||[]).forEach(c=>{
     if(c.status==='Expired'){
       if(!c.expiredSince) c.expiredSince = t;
@@ -2855,7 +2901,6 @@ Pages.customers = function(){
         <option value="">All Status</option>
         <option value="Active">Active</option>
         <option value="Expired">Expired</option>
-        <option value="Suspended">Suspended</option>
       </select>
       ${hasPerm('customers') ? '<button class="btn" onclick="Customers.openForm()">+ New User</button>' : ''}
       <button class="btn green" onclick="goPage('newconnection')">+ Add New Connection</button>
@@ -2973,7 +3018,6 @@ const Customers = {
           <select id="f_status">
             <option ${c.status==='Active'?'selected':''}>Active</option>
             <option ${c.status==='Expired'?'selected':''}>Expired</option>
-            <option ${c.status==='Suspended'?'selected':''}>Suspended</option>
           </select>
         </div>
       </div>
@@ -3179,16 +3223,27 @@ const Customers = {
     if(body) body.style.display = State._profileDetailsOpen ? '' : 'none';
     if(btn) btn.textContent = State._profileDetailsOpen ? '🔼 Hide Details' : '🔍 Show Details';
   },
+  // Back from a user's profile returns to the page it was opened from
+  // (Recovery, Pending tab, Users, ...). Opening a profile never changes
+  // State.activePage, so it still holds that origin page.
+  backFromProfile(){
+    const from = State.activePage;
+    // Same as the phone's Back button: step back in history when this
+    // profile was reached through the app's own navigation.
+    if(history.state && history.state.prof){ history.back(); return; }
+    goPage(from && MODULES.some(m=>m.key===from) ? from : 'customers');
+  },
   openProfile(id){
     const c = State.data.customers.find(x=>x.id===id);
     if(!c) return;
     State._profileCustomerId = id;
+    navPush({pg:State.activePage, prof:id});
     const ledgerEntries = [
       ...State.data.recoveryPayments.filter(p=>p.customerId===id).map(p=>({date:p.date, type:'credit', amount:p.amount, note:'Payment — '+p.month+(p.collector?' ('+p.collector+')':''), _paymentId:p.id})),
       ...(c.ledger||[])
     ].sort((a,b)=> new Date(a.date)-new Date(b.date));
     $('#pageContent').innerHTML = `
-      <button class="btn gray sm" onclick="goPage('customers')">← Back</button>
+      <button class="btn gray sm" onclick="Customers.backFromProfile()">← Back</button>
       <div class="grid grid-3" style="margin-top:10px;">
         <div class="card" style="grid-column:span 2;">
           <div class="section-title">${esc(c.name)} <span class="badge ${(c.status||'Active').toLowerCase()}">${c.status||'Active'}</span></div>
@@ -4873,7 +4928,7 @@ const Recovery = {
           </select></div>
         <div class="field" id="pr_monthWrap" style="display:none;"><label>Month</label><select id="pr_month">${opts}</select></div>
         <div class="field"><label>User Status</label>
-          <select id="pr_status"><option value="">All users</option><option>Active</option><option>Expired</option><option>Suspended</option></select></div>
+          <select id="pr_status"><option value="">All users</option><option>Active</option><option>Expired</option></select></div>
         <div class="field"><label>Minimum Pending (Rs.)</label><input type="number" id="pr_min" placeholder="0"></div>
         <div class="field"><label>Sort By</label>
           <select id="pr_sort"><option value="amount">Highest amount first</option><option value="oldest">Oldest due first</option><option value="name">Name (A–Z)</option></select></div>
@@ -5448,21 +5503,18 @@ const Recovery = {
   simulateDisconnect(customerId){
     const c = State.data.customers.find(x=>x.id===customerId);
     if(!c) return;
-    if(!confirm('Simulate disconnect for '+c.name+'? This sets their status to Suspended.')) return;
-    c.status = 'Suspended';
-    // Mark the start of this suspension window so billing stops accruing
-    // for full calendar months from here on (see custIsMonthSuspended).
-    // Guard against double-setting if already suspended for some reason.
-    if(!c.suspendedSince) c.suspendedSince = todayISO();
+    if(!confirm('Simulate disconnect for '+c.name+'? This sets their status to Expired.')) return;
+    c.status = 'Expired';
+    // reconcileExpiry() (run on save) records the expiry date, which stops billing.
     const mtLive = State.data.settings.mikrotikIntegration && State.data.settings.mikrotikIntegration.liveSync;
     if(mtLive && c.pppoeUsername){
       fbFunctions.httpsCallable('controlMikrotikSecret')({ ...MikroTik._authPayload(), secretName:c.pppoeUsername, enable:false })
         .then(res=>MikroTik2.logConsole('Disconnect', c.name+' (PPPoE: '+c.pppoeUsername+') — '+(res.data.success?res.data.message:'FAILED: '+res.data.message)))
         .catch(err=>MikroTik2.logConsole('Disconnect', c.name+' (PPPoE: '+c.pppoeUsername+') — FAILED: '+err.message));
     }else{
-      MikroTik2.logConsole('Disconnect', c.name+' (PPPoE: '+(c.pppoeUsername||'—')+') — status set to Suspended'+(mtLive?' (no PPPoE username on file — router not contacted)':' (Offline/Manual mode — router not contacted)'));
+      MikroTik2.logConsole('Disconnect', c.name+' (PPPoE: '+(c.pppoeUsername||'—')+') — status set to Expired'+(mtLive?' (no PPPoE username on file — router not contacted)':' (Offline/Manual mode — router not contacted)'));
     }
-    persist(); toast('Disconnect simulated — '+c.name+' marked Suspended','ok'); renderPage();
+    persist(); toast('Disconnect simulated — '+c.name+' marked Expired','ok'); renderPage();
   },
   extendGrace(customerId){
     const c = State.data.customers.find(x=>x.id===customerId);
@@ -7017,7 +7069,7 @@ Pages.reports = function(){
   const thisMonthIncome = d.profitLedger.filter(x=>x.type==='income' && monthKey(x.date)===mk).reduce((s,x)=>s+Number(x.amount||0),0);
   const thisMonthExpense = d.profitLedger.filter(x=>x.type==='expense' && monthKey(x.date)===mk).reduce((s,x)=>s+Number(x.amount||0),0);
   const totalOutstanding = d.customers.reduce((s,c)=>s+custPendingBalance(c),0);
-  const statusCounts = {Active:0, Expired:0, Suspended:0};
+  const statusCounts = {Active:0, Expired:0};
   d.customers.forEach(c=>{ const st=c.status||'Active'; if(statusCounts[st]!=null) statusCounts[st]++; });
   const lowStock = d.inventory.filter(i=>Number(i.qty||0) <= Number(i.lowThreshold||3));
   const topDefaulters = d.customers.map(c=>({c,bal:custPendingBalance(c)})).filter(x=>x.bal>0).sort((a,b)=>b.bal-a.bal).slice(0,10);
@@ -7095,7 +7147,7 @@ Pages.reports = function(){
       <div class="card stat-card"><div class="lbl">Total Users</div><div class="val">${d.customers.length}</div></div>
       <div class="card">
         <div class="section-title">👥 User Status Breakdown</div>
-        <div class="small-muted">Active: <b>${statusCounts.Active}</b> &nbsp;|&nbsp; Expired: <b>${statusCounts.Expired}</b> &nbsp;|&nbsp; Suspended: <b>${statusCounts.Suspended}</b></div>
+        <div class="small-muted">Active: <b>${statusCounts.Active}</b> &nbsp;|&nbsp; Expired: <b>${statusCounts.Expired}</b></div>
       </div>
       <div class="card">
         <div class="section-title">📦 Low Stock Alert</div>
