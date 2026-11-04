@@ -2546,7 +2546,7 @@ Pages.dashboard = function(){
   // & Dues and the per-customer breakdown — a customer disconnected mid-
   // this-month is still billed in full for that month, and new connections
   // owe their pro-rata first-month amount, not the full monthlyRate.
-  const expectedThisMonth = d.customers.reduce((s,c)=>s+custMonthDueAmount(c, thisMonth),0);
+  const expectedThisMonth = d.customers.reduce((s,c)=>s+custMonthDueAmount(c, thisMonth),0) - monthDiscountTotal(thisMonth);
   const cardColor = (d.settings.theme && d.settings.theme.dashboardCardColor) || '#f97316';
   // Quick-Access cards: exact same module list, permission check (hasPerm)
   // and goPage() navigation the sidebar already uses — clicking a card
@@ -2707,9 +2707,32 @@ function custMonthPaidAmount(c, mKey){
 function paymentCashAmount(p){
   return Number(p.amount||0) - Number(p.discount||0);
 }
+// A discount reduces what is EXPECTED for the month it was given on (the
+// customer is billed less), so Expected, Collected (cash) and Pending agree:
+// bill 1,000 - discount 100 = Expected 900, Collected 900, Pending 0 — instead
+// of Expected 1,000 / Collected 900 / "Pending 100" for a fully settled user.
+function monthDiscountTotal(mKey){
+  return State.data.recoveryPayments.filter(p=>p.month===mKey).reduce((s,p)=>s+Number(p.discount||0),0);
+}
+function custTotalDiscount(c){
+  return State.data.recoveryPayments.filter(p=>p.customerId===c.id).reduce((s,p)=>s+Number(p.discount||0),0);
+}
+// Advance credit that came from a discounted payment (the old behaviour
+// saved the discount as credit) is not real money and must not reduce the
+// pending balance of other months — strip each such credit by the discount
+// recorded on the same payment.
+function custEffectiveCredit(c){
+  const discByGroup = {};
+  State.data.recoveryPayments.forEach(p=>{ if(p.customerId===c.id && p.groupId && Number(p.discount)>0) discByGroup[p.groupId]=(discByGroup[p.groupId]||0)+Number(p.discount); });
+  return (c.ledger||[]).filter(l=>l.type==='credit').reduce((s,l)=>{
+    let a = Number(l.amount)||0;
+    if(l.groupId && discByGroup[l.groupId]){ const cut = Math.min(a, discByGroup[l.groupId]); a -= cut; discByGroup[l.groupId] -= cut; }
+    return s + a;
+  },0);
+}
 function custTotalCashRecovered(c){
   return State.data.recoveryPayments.filter(p=>p.customerId===c.id).reduce((s,p)=>s+paymentCashAmount(p),0)
-       + (c.ledger||[]).filter(l=>l.type==='credit').reduce((s,l)=>s+Number(l.amount),0);
+       + custEffectiveCredit(c);
 }
 function custTotalBilled(c){
   const months = custMonthsSinceConnection(c);
@@ -2724,7 +2747,7 @@ function custTotalBilled(c){
 }
 function custTotalPaid(c){
   return State.data.recoveryPayments.filter(p=>p.customerId===c.id).reduce((s,p)=>s+Number(p.amount),0)
-       + (c.ledger||[]).filter(l=>l.type==='credit').reduce((s,l)=>s+Number(l.amount),0);
+       + custEffectiveCredit(c);
 }
 function custPendingBalance(c){
   return Math.max(0, custTotalBilled(c) - custTotalPaid(c));
@@ -4606,6 +4629,7 @@ const NewConnection = {
    MODULE: MONTH-WISE RECOVERY ENGINE
    ========================================================================= */
 Pages.recovery = function(){
+  if(State._recTab==='pending') return Pages.recoveryPending();
   const d = State.data;
   // Requirement 4 — Recovery & Pending Dues is one unified dashboard for
   // everyone (Month Picker, Search, Status Filter, and one dynamic
@@ -4636,6 +4660,7 @@ Pages.recovery = function(){
   const rRepTo = State._recRangeEnd || todayISO();
   $('#pageContent').innerHTML = `
     <div class="recovery-sticky-bar" id="recoveryStickyBar">
+      ${Recovery.tabsHtml('monthly')}
       <div class="search-bar" style="flex-wrap:wrap;">
         <input id="recSearch" placeholder="Search by name, phone, or User ID..." value="${esc(searchInit)}">
         <select id="recStatusFilter">
@@ -4682,12 +4707,15 @@ Pages.recovery = function(){
     // can never drift from what each customer row actually shows.
     let expected, collected, dueFn, paidFn;
     if(allMonths){
-      expected = d.customers.reduce((s,c)=>s+custTotalBilled(c),0);
+      expected = d.customers.reduce((s,c)=>s+custTotalBilled(c)-custTotalDiscount(c),0);
       collected = d.customers.reduce((s,c)=>s+custTotalCashRecovered(c),0);
-      dueFn = c=>custPendingBalance(c);
+      // BUGFIX: rows used to take due = pending balance (already billed - paid)
+      // and then subtract paid AGAIN, so anyone who had paid more than their
+      // remaining balance showed as settled in All Months. Use billed - paid.
+      dueFn = c=>custTotalBilled(c);
       paidFn = c=>custTotalPaid(c);
     }else{
-      expected = d.customers.reduce((s,c)=>s+custMonthDueAmount(c, month),0);
+      expected = d.customers.reduce((s,c)=>s+custMonthDueAmount(c, month),0) - monthDiscountTotal(month);
       collected = d.recoveryPayments.filter(p=>p.month===month).reduce((s,p)=>s+paymentCashAmount(p),0);
       dueFn = c=>custMonthDueAmount(c, month);
       paidFn = c=>custMonthPaidAmount(c, month);
@@ -4747,7 +4775,150 @@ Pages.recovery = function(){
 // the Pending Dues sidebar/dashboard entry stays (so nothing referencing
 // goPage('pending') breaks) but renders the exact same merged view.
 Pages.pending = Pages.recovery;
+
+// ===== Recovery → Pending tab =====
+// Its own view (not a filter combination): every user who still owes money,
+// across all months, largest first — with a report generator that has
+// options (period, user status, minimum amount, sort, month-wise detail).
+function pendingUserRows(){
+  return State.data.customers.map(c=>{
+    const list = custUnpaidMonthsList(c);
+    const realMonths = list.filter(u=>u.month!=='OPENING');
+    return {c, pending:custPendingBalance(c), list, months:list.length, oldest: realMonths.length ? realMonths[0].month : (list.length ? 'OPENING' : null)};
+  }).filter(x=>x.pending>0.01);
+}
+Pages.recoveryPending = function(){
+  const d = State.data;
+  const searchInit = State._pendSearch || '';
+  $('#pageContent').innerHTML = `
+    <div class="recovery-sticky-bar" id="recoveryStickyBar">
+      ${Recovery.tabsHtml('pending')}
+      <div class="search-bar" style="flex-wrap:wrap;">
+        <input id="pendSearch" placeholder="Search by name, phone, or User ID..." value="${esc(searchInit)}">
+        <button class="btn green" onclick="Recovery.openPaymentGeneral()">💵 New Collection</button>
+        <button class="btn gray" onclick="Recovery.openPendingReport()">📊 Pending Users Report</button>
+      </div>
+      <div class="grid grid-3" id="pendStats"></div>
+    </div>
+    <div class="card" style="margin-top:10px;">
+      <div class="section-title">⏳ Pending Amounts — All Months</div>
+      <div id="pendBody" class="item-card-list"></div>
+    </div>
+  `;
+  const topbarEl = document.querySelector('.topbar');
+  $('#recoveryStickyBar').style.top = (topbarEl ? topbarEl.offsetHeight : 0)+'px';
+  const render = ()=>{
+    State._pendSearch = $('#pendSearch').value||'';
+    const q = State._pendSearch.toLowerCase();
+    const all = pendingUserRows();
+    const total = all.reduce((s,x)=>s+x.pending,0);
+    const oldestKeys = all.map(x=>x.oldest).filter(m=>m && m!=='OPENING').sort();
+    const oldestTxt = oldestKeys.length ? monthLabel(oldestKeys[0]+'-01') : (all.length ? 'Opening Balance' : '—');
+    $('#pendStats').innerHTML = `
+      <div class="card stat-card accent-red"><div class="lbl">Total Pending</div><div class="val">${fmtMoney(total)}</div></div>
+      <div class="card stat-card"><div class="lbl">Users with Pending</div><div class="val">${all.length}</div></div>
+      <div class="card stat-card"><div class="lbl">Oldest Unpaid</div><div class="val" style="font-size:16px;">${oldestTxt}</div></div>
+    `;
+    const rows = all.filter(x=>!q || (x.c.name||'').toLowerCase().includes(q) || (x.c.phone||'').includes(q) || x.c.id.includes(q))
+      .sort((a,b)=>b.pending-a.pending);
+    $('#pendBody').innerHTML = rows.map(({c,pending,months,oldest}, idx)=>{
+      const tag = c.status==='Suspended' || c.status==='Expired' ? ` <span class="badge expired" style="font-size:10px;padding:1px 6px;">${c.status}</span>` : '';
+      const since = oldest ? (oldest==='OPENING' ? 'opening balance' : 'since '+monthLabel(oldest+'-01')) : '';
+      return `<div class="rec-simple-row" id="rec-row-${c.id}">
+        <div class="rec-sr">${idx+1}</div>
+        <div class="rec-name"><a href="javascript:void(0)" onclick="Customers.openProfile('${c.id}')">${esc(c.name)}</a>${tag}<div class="small-muted" style="font-size:11px;">${months} unpaid month(s)${since?' · '+since:''}</div></div>
+        <div class="rec-amt" style="color:var(--red);">${fmtMoney(pending)}</div>
+        <div class="rec-btns">
+          <button class="btn sm green" onclick="Recovery.markPaidRow('${c.id}')">✅ Paid</button>
+          <button class="btn sm" style="background:#25D366;" onclick="Receipts.sendWhatsAppAlert('${c.id}')">💬 Reminder</button>
+        </div>
+      </div>`;
+    }).join('') || '<div class="empty-state"><div class="ic">✅</div>No pending amounts</div>';
+  };
+  $('#pendSearch').oninput = render;
+  render();
+};
 const Recovery = {
+  // Monthly | Pending switch shown at the top of the Recovery page.
+  tabsHtml(active){
+    const st = on => on ? 'flex:1;background:#0ea5e9;color:#fff;' : 'flex:1;background:#e2e8f0;color:#334155;';
+    return `<div style="display:flex;gap:8px;margin-bottom:8px;">
+      <button class="btn" style="${st(active==='monthly')}" onclick="Recovery.setTab('monthly')">📅 Monthly</button>
+      <button class="btn" style="${st(active==='pending')}" onclick="Recovery.setTab('pending')">⏳ Pending</button>
+    </div>`;
+  },
+  setTab(tab){
+    if(tab==='pending'){
+      if(State._recoveryMonth && State._recoveryMonth!=='ALL') State._recPrevMonth = State._recoveryMonth;
+      State._recTab = 'pending';
+      State._recoveryMonth = 'ALL'; // so the row "✅ Paid" button settles the OLDEST unpaid month
+    } else {
+      State._recTab = 'monthly';
+      State._recoveryMonth = State._recPrevMonth || monthKey(todayISO());
+    }
+    renderPage();
+  },
+  // ----- Pending Users Report (with options) -----
+  openPendingReport(){
+    const months = new Set([monthKey(todayISO())]);
+    State.data.customers.forEach(c=>{ (custUnpaidMonthsList(c)).forEach(u=>{ if(u.month!=='OPENING') months.add(u.month); }); });
+    const opts = Array.from(months).sort().reverse().map(m=>`<option value="${m}">${monthLabel(m+'-01')}</option>`).join('');
+    openModal(`
+      <div class="modal-header"><h3>🧾 Pending Users Report</h3><button class="modal-close" onclick="closeModal()">×</button></div>
+      <div class="form-grid" style="margin-bottom:8px;">
+        <div class="field"><label>Period</label>
+          <select id="pr_period" onchange="document.getElementById('pr_monthWrap').style.display=this.value==='MONTH'?'':'none'">
+            <option value="ALL">All pending months</option>
+            <option value="MONTH">One specific month</option>
+          </select></div>
+        <div class="field" id="pr_monthWrap" style="display:none;"><label>Month</label><select id="pr_month">${opts}</select></div>
+        <div class="field"><label>User Status</label>
+          <select id="pr_status"><option value="">All users</option><option>Active</option><option>Expired</option><option>Suspended</option></select></div>
+        <div class="field"><label>Minimum Pending (Rs.)</label><input type="number" id="pr_min" placeholder="0"></div>
+        <div class="field"><label>Sort By</label>
+          <select id="pr_sort"><option value="amount">Highest amount first</option><option value="oldest">Oldest due first</option><option value="name">Name (A–Z)</option></select></div>
+        <div class="field"><label>Month-wise Detail</label>
+          <select id="pr_detail"><option value="0">Hide</option><option value="1">Show each unpaid month</option></select></div>
+        <div class="field" style="align-self:flex-end;display:flex;gap:6px;">
+          <button class="btn" onclick="Recovery.renderPendingReport()">Generate Report</button>
+          <button class="btn gray" onclick="printTable('Pending Users Report','#pendRepTable')">🖨️ Print</button>
+        </div>
+      </div>
+      <div id="pendReportBody"></div>
+    `);
+    Recovery.renderPendingReport();
+  },
+  renderPendingReport(){
+    const period = $('#pr_period').value, month = $('#pr_month') ? $('#pr_month').value : '';
+    const stat = $('#pr_status').value, min = Number($('#pr_min').value)||0, sort = $('#pr_sort').value, detail = $('#pr_detail').value==='1';
+    let rows;
+    if(period==='MONTH'){
+      rows = State.data.customers.map(c=>{
+        const rem = Math.round((custMonthDueAmount(c, month) - custMonthPaidAmount(c, month))*100)/100;
+        return {c, pending:rem, list: rem>0.01 ? [{month, remaining:rem}] : [], months:1, oldest:month};
+      }).filter(x=>x.pending>0.01);
+    } else {
+      rows = pendingUserRows();
+    }
+    rows = rows.filter(x=>(!stat || x.c.status===stat) && x.pending >= min);
+    rows.sort((a,b)=> sort==='name' ? (a.c.name||'').localeCompare(b.c.name||'')
+      : sort==='oldest' ? String(a.oldest==='OPENING'?'0000':(a.oldest||'9999')).localeCompare(String(b.oldest==='OPENING'?'0000':(b.oldest||'9999'))) || (b.pending-a.pending)
+      : (b.pending-a.pending));
+    const total = rows.reduce((s,x)=>s+x.pending,0);
+    const scope = (period==='MONTH' ? monthLabel(month+'-01') : 'All pending months') + (stat?' · '+stat+' users':'') + (min>0?' · min '+fmtMoney(min):'');
+    $('#pendReportBody').innerHTML = `
+      <div class="table-wrap">
+      <table id="pendRepTable">
+        <caption style="text-align:left;font-size:12px;padding:4px 0;"><b>${esc(scope)}</b> — ${rows.length} user(s), Total Pending: <b>${fmtMoney(total)}</b></caption>
+        <thead><tr><th>#</th><th>User</th><th>Phone</th><th>Package</th><th>Months</th><th>Pending</th></tr></thead>
+        <tbody>${rows.map((x,i)=>`<tr>
+          <td>${i+1}</td><td>${esc(x.c.name)}</td><td>${esc(x.c.phone||'-')}</td><td>${esc(x.c.package||'-')}</td>
+          <td>${period==='MONTH' ? monthLabel(month+'-01') : x.months+(detail ? '<div class="small-muted" style="font-size:11px;">'+x.list.map(u=>monthOrOpeningLabel(u.month).replace('📋 ','')+': '+fmtMoney(u.remaining)).join('<br>')+'</div>' : '')}</td>
+          <td><b>${fmtMoney(x.pending)}</b></td></tr>`).join('') || '<tr><td colspan="6" class="small-muted">No pending users for these options</td></tr>'}
+        </tbody>
+        <tfoot><tr><td colspan="5"><b>Total</b></td><td><b>${fmtMoney(total)}</b></td></tr></tfoot>
+      </table></div>`;
+  },
   // New Collection Form, general entry point (not tied to a row): pick any
   // customer from a dropdown, and their outstanding balance / package
   // auto-fill instead of having to open the customer profile first.
@@ -4812,7 +4983,7 @@ const Recovery = {
     const advanceSelected = !forcedMonth && !unpaid.length;
     const targetSelect = `
       <div class="field field-full"><label>Target Month (which bill is this payment for?)</label>
-        <select id="f_rectargetmonth" onchange="Recovery._onTargetMonthChange('${customerId}')">
+        <select id="f_rectargetmonth" onchange="this.dataset.manual='1';Recovery._onTargetMonthChange('${customerId}')">
           ${monthOpts}${forcedExtraOpt}
           <option value="ADVANCE" ${advanceSelected?'selected':''}>➕ Advance / General Credit (no specific month)</option>
         </select>
@@ -4834,7 +5005,7 @@ const Recovery = {
       <div class="form-grid">
         ${targetSelect}
         <div class="field"><label>Amount Received</label><input type="number" id="f_recamt" value="${suggestedAmt}" oninput="this.dataset.touched='1';Recovery.updatePaymentPreview('${customerId}')"></div>
-        <div class="field"><label>Discount</label><input type="number" id="f_recdiscount" placeholder="0" oninput="Recovery._onDiscountInput('${customerId}')"></div>
+        <div class="field"><label>Discount (only for the Target Month above)</label><input type="number" id="f_recdiscount" placeholder="0" oninput="Recovery._onDiscountInput('${customerId}')"></div>
         <div class="field"><label>Payment Method</label>
           <select id="f_recmethod">
             <option value="Cash">Cash</option>
@@ -4890,6 +5061,15 @@ const Recovery = {
   // settles ONLY the selected target month, up to that month's remaining
   // due. Anything left over is never pushed onto older/other unpaid months
   // automatically — it's recorded as an unallocated advance/credit instead.
+  // A discount belongs to the ONE month being paid and only fills the gap
+  // between the cash received and that month's remaining bill. Anything
+  // beyond that gap is NOT applied (it used to be saved as advance credit,
+  // which then reduced the customer's pending balance for ALL other months).
+  _effectiveDiscount(monthRemaining, amount, discount){
+    const d = Math.max(0, Number(discount)||0), a = Math.max(0, Number(amount)||0);
+    const eff = Math.max(0, Math.min(d, Math.round((monthRemaining - a)*100)/100));
+    return {eff, ignored: Math.round((d-eff)*100)/100};
+  },
   _allocateTargeted(customerId, amount, targetMonth){
     const c = State.data.customers.find(x=>x.id===customerId);
     const due = targetMonth==='ADVANCE' ? 0 : custMonthDueAmount(c, targetMonth);
@@ -4908,24 +5088,22 @@ const Recovery = {
     const targetMonth = targetSel ? targetSel.value : 'ADVANCE';
     const amt = Number($('#f_recamt') && $('#f_recamt').value)||0;
     const discount = Number($('#f_recdiscount') && $('#f_recdiscount').value)||0;
-    const allocations = Recovery._allocateTargeted(customerId, amt + discount, targetMonth);
+    const c = State.data.customers.find(x=>x.id===customerId);
+    const mRem0 = (c && targetMonth!=='ADVANCE') ? Math.max(0, custMonthDueAmount(c, targetMonth) - custMonthPaidAmount(c, targetMonth)) : 0;
+    const dsplit = targetMonth==='ADVANCE' ? {eff:0, ignored:discount} : Recovery._effectiveDiscount(mRem0, amt, discount);
+    const allocations = Recovery._allocateTargeted(customerId, amt + dsplit.eff, targetMonth);
     const fp = $('#fifoPreview'); if(!fp) return;
     fp.innerHTML = allocations.length ? allocations.map(a=>
       `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;border-bottom:1px dashed var(--border);">
         <span>${a.advance?'Advance / unallocated credit':monthOrOpeningLabel(a.month)}${a.partial?' (Partial)':''}</span><b>${fmtMoney(a.amount)}</b>
-      </div>`).join('') + (discount>0?`<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;color:var(--amber);"><span>Discount applied</span><b>−${fmtMoney(discount)}</b></div>`:'')
+      </div>`).join('') + (dsplit.eff>0?`<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;color:var(--amber);"><span>Discount applied — ${targetMonth==='ADVANCE'?'':monthOrOpeningLabel(targetMonth)} only</span><b>−${fmtMoney(dsplit.eff)}</b></div>`:'')
       : '<div class="small-muted">Enter an amount</div>';
-    const c = State.data.customers.find(x=>x.id===customerId);
-    if(c && discount>0 && targetMonth!=='ADVANCE'){
-      const mRem = Math.max(0, custMonthDueAmount(c, targetMonth) - custMonthPaidAmount(c, targetMonth));
-      const extra = Math.round((amt + discount - mRem)*100)/100;
-      if(extra > 0.01) fp.innerHTML += `<div style="font-size:12px;padding:5px 0;color:var(--red);">⚠️ Amount + discount is ${fmtMoney(extra)} more than what is due. That extra will be saved as advance credit and counted as Recovery income — lower the Amount Received if the discount replaces it.</div>`;
-    }
+    if(dsplit.ignored>0.01) fp.innerHTML += `<div style="font-size:12px;padding:5px 0;color:var(--red);">⚠️ ${fmtMoney(dsplit.ignored)} of the discount will NOT be applied — a discount only covers what is still unpaid on this month after the amount received, and is never carried to other months.</div>`;
     const rem = $('#fifoRemaining');
     if(c && rem){
       const due = targetMonth==='ADVANCE' ? 0 : custMonthDueAmount(c, targetMonth);
       const paidSoFar = targetMonth==='ADVANCE' ? 0 : custMonthPaidAmount(c, targetMonth);
-      rem.textContent = fmtMoney(Math.max(0, due - paidSoFar - amt - discount));
+      rem.textContent = fmtMoney(Math.max(0, due - paidSoFar - amt - dsplit.eff));
     }
   },
   // Shared "commit to ledger" logic used by the dialog-based Save Payment
@@ -4941,9 +5119,9 @@ const Recovery = {
     const due = targetMonth==='ADVANCE' ? 0 : custMonthDueAmount(c, targetMonth);
     const paidSoFar = targetMonth==='ADVANCE' ? 0 : custMonthPaidAmount(c, targetMonth);
     const monthRemaining = Math.max(0, Math.round((due-paidSoFar)*100)/100);
-    const totalCover = (Number(amount)||0) + (Number(discount)||0);
-    const allocAmount = Math.min(totalCover, monthRemaining);
-    const discountPortion = Math.min(Number(discount)||0, allocAmount);
+    const dsplit = targetMonth==='ADVANCE' ? {eff:0, ignored:Math.max(0,Number(discount)||0)} : Recovery._effectiveDiscount(monthRemaining, amount, discount);
+    const discountPortion = dsplit.eff;
+    const allocAmount = Math.min((Number(amount)||0) + discountPortion, monthRemaining);
     const cashPortion = Math.max(0, allocAmount - discountPortion);
     const overpay = Math.max(0, Math.round(((Number(amount)||0) - cashPortion)*100)/100);
     const allocations = [];
@@ -4969,6 +5147,7 @@ const Recovery = {
       allocations.push({month:'ADVANCE', amount:overpay, advance:true});
     }
     persist();
+    allocations.discountIgnored = dsplit.ignored;
     return allocations;
   },
   // "Redo/undo a wrongly-recorded payment" — reverses one payment
@@ -5091,12 +5270,6 @@ const Recovery = {
     const date = $('#f_recdate').value;
     const collector = $('#f_reccollector').value.trim();
     const targetMonth = $('#f_rectargetmonth') ? $('#f_rectargetmonth').value : undefined;
-    if(discount>0 && targetMonth && targetMonth!=='ADVANCE'){
-      const cc = State.data.customers.find(x=>x.id===customerId);
-      const mRem = cc ? Math.max(0, custMonthDueAmount(cc, targetMonth) - custMonthPaidAmount(cc, targetMonth)) : 0;
-      const extra = Math.round((amt + discount - mRem)*100)/100;
-      if(extra > 0.01 && !confirm('Amount + discount is '+fmtMoney(extra)+' more than what is due for this month.\n\nThe extra '+fmtMoney(extra)+' will be saved as advance credit and added to Recovery income.\n\nPress Cancel to go back and lower the Amount Received.')) return;
-    }
     const allocations = Recovery._commit(customerId, {amount:amt, discount, method, date, collector, targetMonth});
     // Requirement 10 — no intrusive receipt pop-up and no automatic
     // WhatsApp send here: the payment is deducted immediately and a
@@ -5104,6 +5277,7 @@ const Recovery = {
     // the dedicated buttons in the saved-confirmation below.
     Receipts.record(customerId, {amount:amt, date, collector, month: allocations.map(a=>a.advance?'Advance':a.month).join(', ')});
     closeModal();
+    if(allocations.discountIgnored>0.01) toast(fmtMoney(allocations.discountIgnored)+' of the discount was not applied (it only covers this month\'s unpaid balance)','err');
     Recovery._showSavedModal(customerId, amt);
     renderPage();
   },
@@ -5188,10 +5362,10 @@ const Recovery = {
     // and redraw them fresh rather than trying to patch a running total.
     let expected, collected;
     if(allMonths){
-      expected = d.customers.reduce((s,x)=>s+custTotalBilled(x),0);
+      expected = d.customers.reduce((s,x)=>s+custTotalBilled(x)-custTotalDiscount(x),0);
       collected = d.customers.reduce((s,x)=>s+custTotalCashRecovered(x),0);
     }else{
-      expected = d.customers.reduce((s,x)=>s+custMonthDueAmount(x, month),0);
+      expected = d.customers.reduce((s,x)=>s+custMonthDueAmount(x, month),0) - monthDiscountTotal(month);
       collected = d.recoveryPayments.filter(p=>p.month===month).reduce((s,p)=>s+paymentCashAmount(p),0);
     }
     recStats.innerHTML = `
@@ -5200,7 +5374,7 @@ const Recovery = {
       <div class="card stat-card accent-red"><div class="lbl">${allMonths?'Grand Total Pending — All Months':'Total Pending — '+monthLabel(month+'-01')}</div><div class="val">${fmtMoney(Math.max(0,expected-collected))}</div></div>
     `;
 
-    const due = allMonths ? custPendingBalance(c) : custMonthDueAmount(c, month);
+    const due = allMonths ? custTotalBilled(c) : custMonthDueAmount(c, month);
     const paid = allMonths ? custTotalPaid(c) : custMonthPaidAmount(c, month);
     const status = due===0
       ? ((!allMonths && custMonthFreeLabel(c, month)) || 'Paid')
