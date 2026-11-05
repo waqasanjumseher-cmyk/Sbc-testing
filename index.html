@@ -7402,6 +7402,7 @@ const Reports = {
   // custom date range, per customer, with a grand total. Reads straight
   // from recoveryPayments (the same source Recovery & Dues and Undo/Edit
   // use), so it always matches those figures exactly.
+  setRecRangeMode(v){ State._recRangeMode = (v==='ONTIME') ? 'ONTIME' : 'ALL'; Reports.renderUserRecoveryRange(); },
   renderUserRecoveryRange(){
     const startEl = $('#recRangeStart'), endEl = $('#recRangeEnd');
     const from = startEl ? startEl.value : (State._recRangeStart || daysAgoISO(90));
@@ -7411,9 +7412,17 @@ const Reports = {
     if(!body) return;
     const fromD = new Date(from), toD = new Date(to); toD.setHours(23,59,59,999);
     const allPays = State.data.recoveryPayments;
-    const rows = allPays
-      .filter(p=>{ const dt=new Date(p.date); return dt>=fromD && dt<=toD; })
+    // Report type: 'ALL' = every cash payment received in the period (default);
+    // 'ONTIME' = only on-time recoveries, i.e. the same rule (recoveryIsLate)
+    // the dashboard's Cashflow "Total Recoveries" uses — payments for an
+    // earlier month's bill, and opening balances, are left out.
+    const mode = State._recRangeMode==='ONTIME' ? 'ONTIME' : 'ALL';
+    const inPeriod = allPays
+      .filter(p=>{ const dt=new Date(p.date); return dt>=fromD && dt<=toD; });
+    const rows = inPeriod
+      .filter(p=> mode==='ONTIME' ? !recoveryIsLate(p) : true)
       .slice().sort((a,b)=>new Date(a.date)-new Date(b.date));
+    const olderDues = inPeriod.filter(p=>recoveryIsLate(p)).reduce((s,p)=>s+paymentCashAmount(p),0);
     // Running total settled for each (customer, month) bill, counted in the
     // order payments were made (date, then entry order) — so each row can show
     // what was STILL owed right after that payment, and a bill paid in two
@@ -7432,7 +7441,12 @@ const Reports = {
     // Total Recovered is cash actually received — a discount is a waiver, not cash.
     const total = rows.reduce((s,p)=>s+paymentCashAmount(p),0);
     body.innerHTML = `
-      <div class="small-muted" style="margin-bottom:8px;">${fmtDate(from)} – ${fmtDate(to)} &nbsp;|&nbsp; <b>${rows.length}</b> payment(s) &nbsp;|&nbsp; Total Recovered: <b style="color:var(--green);">${fmtMoney(total)}</b></div>
+      <div class="field" style="margin-bottom:8px;"><label>Report Type</label>
+        <select onchange="Reports.setRecRangeMode(this.value)">
+          <option value="ALL" ${mode==='ALL'?'selected':''}>All cash received in the period</option>
+          <option value="ONTIME" ${mode==='ONTIME'?'selected':''}>On-time recoveries only (same as Cashflow card)</option>
+        </select></div>
+      <div class="small-muted" style="margin-bottom:8px;">${mode==='ONTIME'?'On-time recoveries only':'All cash received'} &nbsp;|&nbsp; ${fmtDate(from)} – ${fmtDate(to)} &nbsp;|&nbsp; <b>${rows.length}</b> payment(s) &nbsp;|&nbsp; Total Recovered: <b style="color:var(--green);">${fmtMoney(total)}</b>${mode==='ALL' && olderDues>0.01 ? `<br>of which older-month dues &amp; opening balances: <b>${fmtMoney(olderDues)}</b> &nbsp;·&nbsp; on-time: <b>${fmtMoney(total-olderDues)}</b>` : ''}</div>
       <div class="table-wrap"><table>
         <thead><tr><th>Date</th><th>User</th><th>Month</th><th>Monthly Bill</th><th>Paid</th><th>Balance</th><th>Collector</th></tr></thead>
         <tbody>
