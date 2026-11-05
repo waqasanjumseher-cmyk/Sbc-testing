@@ -2777,6 +2777,19 @@ function reconcileExpiry(){
 // Amount owed for one specific calendar month for this customer — the first
 // month uses the stored pro-rata amount when available, all other months
 // use the full monthly rate. Months fully covered by a suspension are free.
+// Rate in force for a month. c.rateChanges = [{from:'YYYY-MM', oldRate}] means
+// "before month <from> the rate was <oldRate>"; from that month on, the next
+// entry (or c.monthlyRate, the current rate) applies. Without this, raising a
+// user's rate re-priced EVERY past month and showed the difference as pending.
+function _lastRateChange(c){
+  const ch = (c.rateChanges||[]).filter(x=>x && x.from).slice().sort((a,b)=>a.from<b.from?-1:(a.from>b.from?1:0));
+  return ch.length ? ch[ch.length-1] : null;
+}
+function custRateForMonth(c, mKey){
+  const ch = (c.rateChanges||[]).filter(x=>x && x.from && x.oldRate!=null).slice().sort((a,b)=>a.from<b.from?-1:(a.from>b.from?1:0));
+  for(const x of ch){ if(x.from > mKey) return Number(x.oldRate)||0; }
+  return Number(c.monthlyRate||0);
+}
 function custMonthDueAmount(c, mKey){
   if(mKey === 'OPENING') return Number(c.openingBalance||0);
   if(custIsMonthSuspended(c, mKey)) return 0;
@@ -2788,7 +2801,7 @@ function custMonthDueAmount(c, mKey){
   // Recovery & Dues, and inflated that month's Expected and Total Pending.
   if(firstMonthKey && /^\d{4}-\d{2}$/.test(mKey) && mKey < firstMonthKey) return 0;
   if(mKey === firstMonthKey && c.proRataFirstMonth != null) return Number(c.proRataFirstMonth);
-  return Number(c.monthlyRate||0);
+  return custRateForMonth(c, mKey);
 }
 function custMonthPaidAmount(c, mKey){
   return State.data.recoveryPayments.filter(p=>p.customerId===c.id && p.month===mKey).reduce((s,p)=>s+Number(p.amount),0);
@@ -3093,6 +3106,19 @@ const Customers = {
           </select>
         </div>
         <div class="field"><label>Monthly Rate</label><input type="number" id="f_rate" value="${c.monthlyRate||''}" placeholder="Auto-fills from package — fully editable"></div>
+        <div class="field field-full">
+          <details>
+            <summary style="cursor:pointer;font-weight:600;">⚙️ Rate &amp; Expiry history (fix past months)</summary>
+            <div class="form-grid" style="margin-top:8px;">
+              <div class="field"><label>Previous Rate (before the last change)</label><input type="number" id="f_prevrate" value="${_lastRateChange(c)?_lastRateChange(c).oldRate:''}" placeholder="e.g. 1000"></div>
+              <div class="field"><label>Current rate applies from</label><input type="month" id="f_ratefrom" value="${_lastRateChange(c)?_lastRateChange(c).from:''}"></div>
+              ${c.status==='Expired' ? `<div class="field field-full"><label>Expired since (billing paused from this date)</label><input type="date" id="f_expsince" value="${c.expiredSince||''}"></div>` : ''}
+              <div class="field"><label>Past expired period — from</label><input type="date" id="f_exphfrom" value="${(c.expiredHistory&&c.expiredHistory.length)?c.expiredHistory[c.expiredHistory.length-1].from:''}"></div>
+              <div class="field"><label>Past expired period — to (reactivated)</label><input type="date" id="f_exphto" value="${(c.expiredHistory&&c.expiredHistory.length)?c.expiredHistory[c.expiredHistory.length-1].to:''}"></div>
+            </div>
+            <div class="small-muted">Months in an expired period are not billed (the month of reactivation is). Clear both dates to remove the period.</div>
+          </details>
+        </div>
         <div class="field"><label>Status</label>
           <select id="f_status">
             <option ${c.status==='Active'?'selected':''}>Active</option>
@@ -3138,8 +3164,22 @@ const Customers = {
       suspendedSince: id ? (existing.suspendedSince ?? null) : null,
       suspensionHistory: id ? (existing.suspensionHistory ? existing.suspensionHistory.slice() : []) : [],
       expiredSince: id ? (existing.expiredSince ?? null) : null,
-      expiredHistory: id ? (existing.expiredHistory ? existing.expiredHistory.slice() : []) : []
+      expiredHistory: id ? (existing.expiredHistory ? existing.expiredHistory.map(x=>({...x})) : []) : [],
+      rateChanges: id ? (existing.rateChanges ? existing.rateChanges.map(x=>({...x})) : []) : []
     };
+    // --- Rate & Expiry history editor (only touches what the staff changed) ---
+    if($('#f_prevrate')){
+      const pr = $('#f_prevrate').value, fr = $('#f_ratefrom').value;
+      rec.rateChanges.sort((a,b)=>a.from<b.from?-1:(a.from>b.from?1:0));
+      if(pr!=='' && fr){ const entry = {from:fr, oldRate:Number(pr)||0}; if(rec.rateChanges.length) rec.rateChanges[rec.rateChanges.length-1] = entry; else rec.rateChanges.push(entry); }
+      else if(pr==='' && !fr && rec.rateChanges.length){ rec.rateChanges.pop(); }
+    }
+    if($('#f_expsince') && existing && existing.status==='Expired' && $('#f_expsince').value) rec.expiredSince = $('#f_expsince').value;
+    if($('#f_exphfrom') && $('#f_exphto')){
+      const hf = $('#f_exphfrom').value, ht = $('#f_exphto').value;
+      if(hf && ht){ const e = {from:hf, to:ht}; if(rec.expiredHistory.length) rec.expiredHistory[rec.expiredHistory.length-1] = e; else rec.expiredHistory.push(e); }
+      else if(!hf && !ht && rec.expiredHistory.length){ rec.expiredHistory.pop(); }
+    }
     // Keep suspension tracking consistent even when staff change Status
     // from this plain dropdown instead of using Simulate Disconnect /
     // Reconnect — otherwise billing either silently keeps accruing during
@@ -3168,12 +3208,35 @@ const Customers = {
   // Expired -> Active. Same effect as changing Status in the Edit form (the
   // status label only; no billing or ledger change). Suspended users are left
   // alone here because suspension pauses billing and is handled through Edit.
+  // Reactivating asks WHEN the expiry started, so the months in between stay
+  // unbilled (e.g. expired in August, back now: Aug–previous month are free).
+  openReactivate(id){
+    const c = State.data.customers.find(x=>x.id===id); if(!c) return;
+    openModal(`
+      <div class="modal-header"><h3>Make Active — ${esc(c.name)}</h3><button class="modal-close" onclick="closeModal()">×</button></div>
+      <div class="field"><label>Expired since</label><input type="date" id="f_reactsince" value="${c.expiredSince||todayISO()}"></div>
+      <div class="small-muted" style="margin:6px 0;">Months from this date up to last month are not billed. This month onward is billed as normal.</div>
+      <div class="modal-actions">
+        <button class="btn gray" onclick="closeModal()">Cancel</button>
+        <button class="btn green" onclick="Customers.confirmReactivate('${id}')">✅ Make Active</button>
+      </div>`);
+  },
+  confirmReactivate(id){
+    const c = State.data.customers.find(x=>x.id===id); if(!c) return;
+    const since = $('#f_reactsince').value;
+    if(since) c.expiredSince = since;
+    c.status = 'Active';
+    persist(); closeModal();
+    toast(c.name+' is now Active','ok');
+    if(Pages._custRenderRows) Pages._custRenderRows(); else renderPage();
+  },
   toggleStatus(id){
     const c = State.data.customers.find(x=>x.id===id);
     if(!c) return;
     const cur = c.status || 'Active';
     if(cur==='Suspended'){ toast('Suspended users are changed from Edit','err'); return; }
-    c.status = (cur==='Active') ? 'Expired' : 'Active';
+    if(cur==='Expired'){ Customers.openReactivate(id); return; }
+    c.status = 'Expired';
     persist();
     toast(c.name+' is now '+c.status+' — tap again to switch back','ok');
     if(Pages._custRenderRows) Pages._custRenderRows(); else renderPage();
@@ -3245,6 +3308,13 @@ const Customers = {
           </select>
         </div>
         <div class="field"><label>Monthly Rate</label><input type="number" id="up_rate" value="${c.monthlyRate||0}" placeholder="Auto-fills from package — fully editable"></div>
+        <div class="field field-full"><label>New rate applies from</label>
+          <select id="up_from">
+            <option value="THIS">This month (${monthLabel(monthKey(todayISO())+'-01')})</option>
+            <option value="NEXT">Next month (${monthLabel(_monthAfter(monthKey(todayISO()))+'-01')})</option>
+          </select>
+          <div class="small-muted" style="margin-top:4px;">Earlier months stay billed at the old rate (${fmtMoney(c.monthlyRate)}).</div>
+        </div>
         <div class="field field-full"><label>PPPoE Username</label><input id="up_pppoe" value="${esc(c.pppoeUsername||'')}" placeholder="MikroTik secret name"></div>
         <div class="field field-full"><label>New MikroTik PPPoE Profile</label><input id="up_profile" placeholder="e.g. 20mb-profile"></div>
       </div>
@@ -3259,7 +3329,15 @@ const Customers = {
     const c = State.data.customers.find(x=>x.id===id);
     if(!c) return;
     c.package = $('#up_package').value.trim();
-    c.monthlyRate = Number($('#up_rate').value)||0;
+    const newRate = Number($('#up_rate').value)||0;
+    if(newRate !== Number(c.monthlyRate||0)){
+      const curMk = monthKey(todayISO());
+      const fromMk = ($('#up_from') && $('#up_from').value==='NEXT') ? _monthAfter(curMk) : curMk;
+      c.rateChanges = c.rateChanges || [];
+      // keep the ORIGINAL old rate if this month already has a change recorded
+      if(!c.rateChanges.some(x=>x.from===fromMk)) c.rateChanges.push({from:fromMk, oldRate:Number(c.monthlyRate||0)});
+    }
+    c.monthlyRate = newRate;
     c.pppoeUsername = $('#up_pppoe').value.trim();
     persist();
     const profile = $('#up_profile').value.trim();
