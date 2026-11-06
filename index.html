@@ -1564,16 +1564,312 @@ function saveLocal(){
   try{ localStorage.setItem(LS_KEY, JSON.stringify(State.data)); }catch(e){ console.warn('local save failed', e); }
 }
 
+
+/* =========================================================================
+   CLOUD STORAGE — monthly split (v2)
+   Firestore caps one document at 1 MB, and the whole business used to live
+   in ONE document (/businesses/{BUSINESS_ID}). Payments, income/expense
+   lines and receipts grow every month, so that document would eventually
+   stop saving. In 'sharded' mode:
+     • /businesses/{BUSINESS_ID}                  → everything EXCEPT the three
+        growing lists, plus a marker  _storage:{version:2}
+     • /businesses/{BUSINESS_ID}/shards/{list}__{YYYY-MM} → that month's rows
+   The app still holds everything in memory exactly as before, so no screen
+   or calculation changes. A save uploads only the month files that changed.
+   'single' mode (the old layout) keeps working until Settings → Cloud Sync →
+   "Split into monthly files" is used.
+   ========================================================================= */
+const SHARD_KEYS = ['recoveryPayments','profitLedger','receipts'];
+// Same value for the same data regardless of key order (Firestore returns
+// fields alphabetically), so "did anything change?" comparisons are reliable.
+function canon(v){
+  if(v===null || typeof v!=='object') return JSON.stringify(v);
+  if(Array.isArray(v)) return '['+v.map(canon).join(',')+']';
+  return '{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+canon(v[k])).join(',')+'}';
+}
+const CloudStore = {
+  mode: 'single',          // 'single' | 'sharded'
+  _modeKnown: false,       // true once this session has actually seen the cloud layout
+  _sent: {},               // shardId -> canon(items) last known to be in the cloud
+  _mainSent: null,         // canon(main doc) last known to be in the cloud
+  _marker: null,
+  _unsubShards: null,
+  _chain: Promise.resolve(),
+  _dirty: false, _dirtyVer: 0, _remotePending: false,
+  mainRef(){ return db.collection('businesses').doc(BUSINESS_ID); },
+  shardsCol(){ return CloudStore.mainRef().collection('shards'); },
+  isDirty(){ return CloudStore._dirty; },
+  markDirty(){ CloudStore._dirty = true; CloudStore._dirtyVer++; },
+  shardIdFor(key, item){
+    const d = item && item.date;
+    const m = (typeof d==='string' && /^\d{4}-\d{2}/.test(d)) ? d.slice(0,7) : 'undated';
+    return key+'__'+m;
+  },
+  stripMain(data){
+    const main = {}; Object.keys(data).forEach(k=>{ if(!SHARD_KEYS.includes(k) && k!=='_storage') main[k]=data[k]; });
+    return main;
+  },
+  splitData(clean){
+    const main = CloudStore.stripMain(clean);
+    const shards = {};
+    SHARD_KEYS.forEach(key=>{
+      (clean[key]||[]).forEach(item=>{
+        const id = CloudStore.shardIdFor(key, item);
+        (shards[id] = shards[id] || {key, month:id.split('__')[1], items:[]}).items.push(item);
+      });
+    });
+    return {main, shards};
+  },
+  // Put shard documents together into State.data's three lists (oldest month
+  // first, original order kept inside each month).
+  applyShardDocs(docs){
+    const byKey = {}, sent = {};
+    docs.forEach(d=>{
+      if(d.id==='_test') return;
+      const x = d.data(); const items = x.items || [];
+      sent[d.id] = canon(items);
+      (byKey[x.key] = byKey[x.key] || []).push({month:x.month || d.id.split('__')[1], items});
+    });
+    SHARD_KEYS.forEach(k=>{
+      const parts = (byKey[k]||[]).sort((a,b)=>a.month<b.month?-1:(a.month>b.month?1:0));
+      State.data[k] = [].concat(...parts.map(p=>p.items));
+    });
+    CloudStore._sent = sent;
+  },
+  // Apply the main document. Returns nothing; sets mode/markers.
+  async applyMain(remote, fetchShards){
+    if(remote && remote._storage && remote._storage.version>=2){
+      CloudStore.mode = 'sharded'; CloudStore._marker = remote._storage; CloudStore._modeKnown = true;
+      const rest = Object.assign({}, remote); delete rest._storage;
+      // An OLD app version that is still open can write the three lists back into
+      // the main document. Keep any such rows (by id) instead of losing them.
+      const legacy = {};
+      SHARD_KEYS.forEach(k=>{ if(Array.isArray(rest[k])){ if(rest[k].length) legacy[k]=rest[k]; delete rest[k]; } });
+      Object.assign(State.data, rest);
+      if(fetchShards){
+        const qs = await CloudStore.shardsCol().get();
+        CloudStore.applyShardDocs(qs.docs);
+      }
+      let recovered = 0;
+      Object.keys(legacy).forEach(k=>{
+        const have = new Set((State.data[k]||[]).map(x=>x && x.id));
+        legacy[k].forEach(it=>{ if(it && it.id && !have.has(it.id)){ (State.data[k] = State.data[k]||[]).push(it); recovered++; } });
+      });
+      CloudStore._mainSent = canon(CloudStore.stripMain(JSON.parse(JSON.stringify(rest))));
+      if(Object.keys(legacy).length){
+        // main still carries old-format lists → rewrite it clean on the next save
+        CloudStore._mainSent = null;
+        setTimeout(()=>{ try{ persist(); }catch(e){} }, 50);
+        if(recovered) console.warn('CloudStore: recovered '+recovered+' row(s) written by an older app version');
+      }
+    } else {
+      CloudStore.mode = 'single'; CloudStore._modeKnown = true;
+      Object.assign(State.data, remote);
+    }
+  },
+  // Read the latest cloud data into State.data. Returns false if no document exists yet.
+  async pull(){
+    const snap = await CloudStore.mainRef().get();
+    if(!snap.exists) return false;
+    await CloudStore.applyMain(snap.data(), true);
+    return true;
+  },
+  // Never write blindly: if this session has not yet seen the cloud layout
+  // (e.g. the first pull timed out), look first — otherwise a one-document
+  // write could overwrite a split database.
+  async ensureMode(){
+    if(CloudStore._modeKnown) return;
+    const snap = await CloudStore.mainRef().get();
+    if(snap.exists){
+      const d = snap.data();
+      if(d && d._storage && d._storage.version>=2){
+        // This device started before it knew the data had been split. Keep the
+        // payments / income-expense lines / receipts it holds that the cloud lacks.
+        const mine = {}; SHARD_KEYS.forEach(k=>{ mine[k] = (State.data[k]||[]).slice(); });
+        await CloudStore.applyMain(d, true);
+        SHARD_KEYS.forEach(k=>{
+          const have = new Set((State.data[k]||[]).map(x=>x && x.id));
+          mine[k].forEach(it=>{ if(it && it.id && !have.has(it.id)) State.data[k].push(it); });
+        });
+        saveLocal();
+      } else CloudStore.mode = 'single';
+    }
+    CloudStore._modeKnown = true;
+  },
+  // Upload what changed. Month files first, then the main document.
+  push(){
+    const run = async ()=>{
+      const ver = CloudStore._dirtyVer;
+      await CloudStore.ensureMode();
+      if(CloudStore.mode!=='sharded'){
+        await db.collection('businesses').doc(BUSINESS_ID).set(cloudSafe(), {merge:false});
+        if(CloudStore._dirtyVer===ver) CloudStore._dirty = false;
+        return;
+      }
+      const clean = cloudSafe();
+      const {main, shards} = CloudStore.splitData(clean);
+      const ops = [];
+      Object.keys(shards).forEach(id=>{
+        const c = canon(shards[id].items);
+        if(CloudStore._sent[id]!==c) ops.push({id, c, doc:{key:shards[id].key, month:shards[id].month, count:shards[id].items.length, items:shards[id].items, updatedAt:Date.now()}});
+      });
+      const dels = Object.keys(CloudStore._sent).filter(id=>!shards[id]);
+      for(let i=0;i<ops.length+dels.length;i+=300){
+        const batch = db.batch();
+        ops.slice(i,i+300).forEach(o=>batch.set(CloudStore.shardsCol().doc(o.id), o.doc));
+        dels.slice(Math.max(0,i-ops.length), Math.max(0,i+300-ops.length)).forEach(id=>batch.delete(CloudStore.shardsCol().doc(id)));
+        await batch.commit();
+      }
+      ops.forEach(o=>{ CloudStore._sent[o.id] = o.c; });
+      dels.forEach(id=>{ delete CloudStore._sent[id]; });
+      main._storage = CloudStore._marker || {version:2};
+      const mc = canon(main);
+      if(mc!==CloudStore._mainSent){
+        await CloudStore.mainRef().set(main, {merge:false});
+        CloudStore._mainSent = mc;
+      }
+      if(CloudStore._dirtyVer===ver) CloudStore._dirty = false;
+      if(CloudStore._remotePending){ CloudStore._remotePending = false; CloudStore.refreshIfChanged(); }
+    };
+    CloudStore._chain = CloudStore._chain.then(run, run);
+    return CloudStore._chain;
+  },
+  // A remote change arrived while we had unsent edits: after our upload, look
+  // again and apply whatever is still different.
+  async refreshIfChanged(){
+    try{
+      const qs = await CloudStore.shardsCol().get();
+      if(CloudStore._shardsDiffer(qs.docs)){ CloudStore.applyShardDocs(qs.docs); CloudStore._afterRemote(); }
+    }catch(e){ /* next snapshot will retry */ }
+  },
+  _shardsDiffer(docs){
+    const seen = {}; let diff = false;
+    docs.forEach(d=>{ if(d.id==='_test') return; seen[d.id]=1; if(CloudStore._sent[d.id]!==canon(d.data().items||[])) diff = true; });
+    Object.keys(CloudStore._sent).forEach(id=>{ if(!seen[id]) diff = true; });
+    return diff;
+  },
+  _afterRemote(){
+    repairData(); saveLocal();
+    const modalOpen = $('#modalBg') && $('#modalBg').classList.contains('show');
+    const midEntryPage = State.activePage === 'newconnection';
+    if(!modalOpen && !midEntryPage) renderPage();
+    renderSidebar();
+    LAST_SYNCED_AT = new Date();
+    $('#syncDot') && $('#syncDot').classList.remove('off'); $('#syncText') && ($('#syncText').textContent='Synced');
+  },
+  attachShardListener(){
+    if(CloudStore._unsubShards || !FIREBASE_READY || !db) return;
+    CloudStore._unsubShards = CloudStore.shardsCol().onSnapshot(qs=>{
+      if(qs.metadata && qs.metadata.hasPendingWrites) return;          // our own un-acknowledged write
+      if(!CloudStore._shardsDiffer(qs.docs)) return;                   // echo of what we already hold
+      if(CloudStore.isDirty()){ CloudStore._remotePending = true; return; } // never overwrite unsent edits
+      CloudStore.applyShardDocs(qs.docs);
+      CloudStore._afterRemote();
+    }, err=>{
+      console.error('Shard listen error', err);
+      LAST_SYNC_ERROR = (err&&err.code?err.code+': ':'')+(err&&err.message?err.message:err);
+      $('#syncDot') && $('#syncDot').classList.add('off'); $('#syncText') && ($('#syncText').textContent='Offline');
+    });
+  },
+  // ---- size meter (approximate: Firestore counts field names + values) ----
+  sizes(){
+    const clean = State.data;
+    const total = new Blob([JSON.stringify(clean)]).size;
+    const mainOnly = new Blob([JSON.stringify(CloudStore.stripMain(clean))]).size;
+    return {total, main:mainOnly};
+  },
+  panelHtml(){
+    const LIMIT = 1048576, z = CloudStore.sizes();
+    const kb = n => Math.round(n/1024).toLocaleString()+' KB';
+    if(CloudStore.mode==='sharded'){
+      const files = Object.keys(CloudStore._sent).length;
+      return `
+        <div class="section-title">🗂 Storage — monthly split ✅</div>
+        <p class="small-muted">Main document ≈ <b>${kb(z.main)}</b> of 1,024 KB. Payments, income/expense lines and receipts are kept in <b>${files}</b> small monthly files, so the 1 MB limit no longer grows with them.</p>
+        <p class="small-muted" style="margin-top:6px;">⚠️ The server-side Automatic Backups copy only the main document. Until that backup function is updated, keep using <b>Export Data (JSON)</b> below as your full backup.</p>`;
+    }
+    const pct = Math.min(100, Math.round(z.total/LIMIT*100));
+    const color = pct>=80 ? 'var(--red)' : (pct>=60 ? 'var(--amber)' : 'var(--green)');
+    return `
+      <div class="section-title">🗂 Storage — single document</div>
+      <p class="small-muted">All data is in one cloud document, which Firestore limits to 1,024 KB. Now ≈ <b style="color:${color};">${kb(z.total)} (${pct}%)</b>. When it fills up, new data stops syncing to the cloud.</p>
+      <div style="height:8px;background:var(--border);border-radius:6px;overflow:hidden;margin:8px 0;"><div style="height:100%;width:${pct}%;background:${color};"></div></div>
+      <button class="btn" onclick="CloudStore.migrate()" ${!FIREBASE_READY?'disabled':''}>✂️ Split into monthly files (recommended)</button>
+      <div id="csStatus" class="small-muted" style="margin-top:8px;"></div>`;
+  },
+  // One-time, checked move from the single document to monthly files.
+  async migrate(){
+    if(!FIREBASE_READY || !db){ toast('Cloud sync is not active','err'); return; }
+    if(CloudStore.mode==='sharded'){ toast('Already using monthly files','ok'); return; }
+    if(!confirm('Split the cloud data into monthly files?\n\n• A safety copy of the current cloud document is saved first.\n• Everything is verified before the switch.\n• Open this app ONLY on this device until it finishes, then reload the app on every other phone/PC.\n\nTip: tap Export Data (JSON) first and keep that file.')) return;
+    const st = msg => { const el = $('#csStatus'); if(el) el.textContent = msg; };
+    try{
+      st('1/6 Checking cloud permissions…');
+      const t = CloudStore.shardsCol().doc('_test');
+      await t.set({t:Date.now()});
+      const tr = await t.get(); if(!tr.exists) throw new Error('A test file could not be read back');
+      await t.delete();
+      st('2/6 Reading the latest cloud data…');
+      await CloudStore.pull();
+      if(CloudStore.mode==='sharded'){ st('Another device has already split the data — nothing to do.'); return; }
+      repairData();
+      st('3/6 Saving a safety copy of the current document…');
+      const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+      await db.collection('businesses_presplit_backup').doc(BUSINESS_ID+'_'+stamp).set(cloudSafe());
+      st('4/6 Writing monthly files…');
+      const verAtCopy = CloudStore._dirtyVer;
+      const clean = cloudSafe();
+      const {main, shards} = CloudStore.splitData(clean);
+      const ids = Object.keys(shards);
+      for(let i=0;i<ids.length;i+=300){
+        const batch = db.batch();
+        ids.slice(i,i+300).forEach(id=>batch.set(CloudStore.shardsCol().doc(id), {key:shards[id].key, month:shards[id].month, count:shards[id].items.length, items:shards[id].items, updatedAt:Date.now()}));
+        await batch.commit();
+      }
+      st('5/6 Verifying every month file…');
+      const qs = await CloudStore.shardsCol().get();
+      const got = {}; qs.docs.forEach(d=>{ if(d.id!=='_test') got[d.id] = canon(d.data().items||[]); });
+      const counts = {};
+      SHARD_KEYS.forEach(k=>{ counts[k] = (clean[k]||[]).length; });
+      const check = {}; SHARD_KEYS.forEach(k=>{ check[k]=0; });
+      ids.forEach(id=>{
+        if(got[id]!==canon(shards[id].items)) throw new Error('Month file '+id+' did not match after saving');
+        check[shards[id].key] += shards[id].items.length;
+      });
+      if(Object.keys(got).length!==ids.length) throw new Error('Unexpected number of month files in the cloud');
+      SHARD_KEYS.forEach(k=>{ if(check[k]!==counts[k]) throw new Error(k+': '+check[k]+' saved vs '+counts[k]+' expected'); });
+      st('6/6 Switching over…');
+      const marker = {version:2, migratedAt:Date.now(), counts};
+      main._storage = marker;
+      await CloudStore.mainRef().set(main, {merge:false});
+      CloudStore.mode = 'sharded'; CloudStore._modeKnown = true; CloudStore._marker = marker;
+      CloudStore._sent = got; CloudStore._mainSent = canon(main);
+      if(CloudStore._dirtyVer===verAtCopy) CloudStore._dirty = false;
+      CloudStore.attachShardListener();
+      toast('Done — data is now stored in monthly files','ok');
+      alert('Done ✅\n\n'+counts.recoveryPayments+' payments, '+counts.profitLedger+' income/expense lines and '+counts.receipts+' receipts were verified.\n\nNow close and reopen the app on every other phone/PC so they use the new version.');
+      if(State.activePage==='settings') renderPage();
+    }catch(e){
+      console.error(e);
+      st('❌ Stopped: '+(e && e.message ? e.message : e)+(/permission/i.test(String(e&&e.message))?'\nFirebase rules must allow /businesses/{id}/shards/{doc}. Nothing was changed.':' — nothing was changed.'));
+      toast('Split stopped — nothing was changed','err');
+    }
+  }
+};
+// One upload path for every save: sharded or single-document.
+function cloudPush(){ return CloudStore.push(); }
+
 let _saveTimer = null;
 function persist(){
   reconcileExpiry();
   saveLocal();
+  CloudStore.markDirty();
   renderSidebar(); // reflect settings/perm changes quickly
   if(FIREBASE_READY && db){
     clearTimeout(_saveTimer);
     $('#syncDot') && $('#syncDot').classList.remove('off'); $('#syncText') && ($('#syncText').textContent = 'Syncing…');
     _saveTimer = setTimeout(()=>{
-      db.collection('businesses').doc(BUSINESS_ID).set(cloudSafe(), {merge:false})
+      cloudPush()
         .then(()=>{ LAST_SYNCED_AT = new Date(); $('#syncText') && ($('#syncText').textContent='Synced'); })
         .catch(err=>{ $('#syncDot') && $('#syncDot').classList.add('off'); $('#syncText') && ($('#syncText').textContent='Sync error'); LAST_SYNC_ERROR = (err&&err.code?err.code+': ':'')+(err&&err.message?err.message:err); console.error(err); });
     }, 600);
@@ -1584,10 +1880,24 @@ function persist(){
 
 function attachFirestoreListener(){
   if(!FIREBASE_READY || !db) return;
-  db.collection('businesses').doc(BUSINESS_ID).onSnapshot(doc=>{
+  db.collection('businesses').doc(BUSINESS_ID).onSnapshot(async doc=>{
     if(doc.exists){
       const remote = doc.data();
-      Object.assign(State.data, remote);
+      const isV2 = remote && remote._storage && remote._storage.version>=2;
+      if(isV2){
+        // Monthly-split layout: main document here, month files in /shards.
+        if(doc.metadata && doc.metadata.hasPendingWrites) return;        // our own un-acknowledged write
+        const firstTime = CloudStore.mode!=='sharded';
+        const probe = Object.assign({}, remote); delete probe._storage;
+        const hasLegacyLists = SHARD_KEYS.some(k=>Array.isArray(probe[k]));
+        if(!firstTime && !hasLegacyLists && canon(CloudStore.stripMain(probe))===CloudStore._mainSent) return; // echo / no change
+        if(!firstTime && CloudStore.isDirty()){ CloudStore._remotePending = true; return; }
+        try{ await CloudStore.applyMain(remote, firstTime); }catch(e){ console.error('Cloud pull failed', e); return; }
+        CloudStore.attachShardListener();
+      }else{
+        CloudStore.mode = 'single'; CloudStore._modeKnown = true;
+        Object.assign(State.data, remote);
+      }
       repairData();
       saveLocal();
       // BUGFIX: a snapshot (including the echo of our own debounced write, or
@@ -1602,15 +1912,16 @@ function attachFirestoreListener(){
       if(!modalOpen && !midEntryPage) renderPage();
       renderSidebar();
       LAST_SYNCED_AT = new Date();
-      $('#syncDot').classList.remove('off'); $('#syncText').textContent='Synced';
+      $('#syncDot') && $('#syncDot').classList.remove('off'); $('#syncText') && ($('#syncText').textContent='Synced');
     }else{
       // first run — push local/default up
+      CloudStore._modeKnown = true;
       db.collection('businesses').doc(BUSINESS_ID).set(cloudSafe());
     }
   }, err=>{
     console.error('Firestore listen error', err);
     LAST_SYNC_ERROR = (err&&err.code?err.code+': ':'')+(err&&err.message?err.message:err);
-    $('#syncDot').classList.add('off'); $('#syncText').textContent='Offline';
+    $('#syncDot') && $('#syncDot').classList.add('off'); $('#syncText') && ($('#syncText').textContent='Offline');
   });
 }
 
@@ -1634,6 +1945,7 @@ const SyncDiag = {
         ${FIREBASE_INIT_ERROR ? `<div><b>Init error:</b> ${esc(FIREBASE_INIT_ERROR)}</div>` : ''}
         <div><b>Signed in to Firebase Auth:</b> ${(fbAuth && fbAuth.currentUser) ? '✅ Yes ('+esc(fbAuth.currentUser.uid)+')' : '❌ No (this session is a local-only login — see note below)'}</div>
         <div><b>Business document:</b> ${esc(BUSINESS_ID)}</div>
+        <div><b>Storage layout:</b> ${CloudStore.mode==='sharded' ? 'monthly files (v2)' : 'single document'}</div>
         <div><b>Last sync status:</b> ${esc($('#syncText') ? $('#syncText').textContent : '—')}</div>
         <div><b>Last synced at:</b> ${LAST_SYNCED_AT ? esc(LAST_SYNCED_AT.toLocaleString()) : '— not yet this session —'}</div>
         <div><b>Last error from Firestore:</b> ${LAST_SYNC_ERROR ? esc(LAST_SYNC_ERROR) : '— none recorded this session —'}</div>
@@ -1789,12 +2101,11 @@ const Auth = {
         // whatever's in this browser's local cache and let login proceed —
         // the Firestore listener attached after login will still catch up
         // once the connection is available.
-        const snap = await Promise.race([
-          db.collection('businesses').doc(BUSINESS_ID).get(),
+        const pulled = await Promise.race([
+          CloudStore.pull(),
           new Promise((_, reject)=> setTimeout(()=> reject(new Error('Pre-login sync timed out')), 8000))
         ]);
-        if(snap.exists){
-          Object.assign(State.data, snap.data());
+        if(pulled){
           repairData();
           saveLocal();
         }
@@ -8096,6 +8407,9 @@ const Settings = {
           <p class="small-muted" style="margin-top:8px;">All business data (including user roles) lives in one synced document, <code>/businesses/${BUSINESS_ID}</code>, updated in real time across every connected device. Writes made while offline are queued and sent automatically the moment connectivity returns — no manual re-sync needed.</p>
           <p class="small-muted" style="margin-top:4px;" id="lastSyncedLine">Last synced: ${LAST_SYNCED_AT ? esc(LAST_SYNCED_AT.toLocaleString()) : 'not yet this session'}</p>
         </div>
+        <div class="card" style="margin-top:10px;" id="storageCard">
+          ${CloudStore.panelHtml()}
+        </div>
         <div class="card" style="margin-top:10px;">
           <div class="section-title">🗄 Automatic Backups</div>
           <p class="small-muted" style="margin-bottom:8px;">
@@ -8911,12 +9225,11 @@ window.addEventListener('DOMContentLoaded', async ()=>{
   // check itself always runs against current values on every device.
   if(FIREBASE_READY && db){
     try{
-      const snap = await Promise.race([
-        db.collection('businesses').doc(BUSINESS_ID).get(),
+      const pulled = await Promise.race([
+        CloudStore.pull(),
         new Promise((_, reject)=> setTimeout(()=> reject(new Error('Boot sync timed out')), 8000))
       ]);
-      if(snap.exists){
-        Object.assign(State.data, snap.data());
+      if(pulled){
         repairData();
         saveLocal();
         applyTheme();
@@ -8952,7 +9265,7 @@ window.addEventListener('online', ()=>{
   if(FIREBASE_READY && db && State.currentUser){
     $('#syncDot') && $('#syncDot').classList.remove('off');
     $('#syncText') && ($('#syncText').textContent = 'Reconnected — syncing…');
-    db.collection('businesses').doc(BUSINESS_ID).set(cloudSafe(), {merge:false})
+    cloudPush()
       .then(()=>{ $('#syncText') && ($('#syncText').textContent='Synced'); })
       .catch(err=>{ console.error(err); });
   }
